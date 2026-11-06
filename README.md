@@ -71,6 +71,9 @@ matching gyro rotation to visual rotation.
 
 ## On the PC
 
+The full PC pipeline (checking, alignment, actions, latents) is in [`pipeline/`](pipeline/README.md).
+
+
 ```
 python tools/check_session.py D:/path/to/SensorCapture
 ```
