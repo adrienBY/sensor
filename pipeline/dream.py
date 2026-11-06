@@ -38,16 +38,15 @@ def decode(vae, z_norm, stats, dtype, chunk=32):
 
 
 @torch.no_grad()
-def rollout(model, take, start, horizon, device, steps=3):
+def rollout(model, take, start, horizon, device, steps=3, amp="fp16"):
     lat, act, ev = take["lat"], take["act"], take["ev"]
     ctx = torch.from_numpy(lat[start:start + wm.CONTEXT])[None].to(device)
-    use_amp = device.type == "cuda"
     dreams = []
     for i in range(horizon):
         k = start + wm.CONTEXT - 1 + i
         a = torch.from_numpy(act[k])[None].to(device)
         e = torch.tensor([ev[k]], device=device)
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+        with wm.autocast(device, amp):
             z = wm.sample_next(model, ctx, a, e, steps=steps)
         dreams.append(z.float())
         ctx = torch.cat([ctx[:, 1:], z[:, None].to(ctx.dtype)], dim=1)
@@ -65,14 +64,14 @@ def psnr(a, b):
 
 
 def make_dream_video(model, take, stats, vae, out_path: Path, fps, seconds=10, start=None,
-                     device=torch.device("cpu"), dtype=torch.float32, steps=3):
+                     device=torch.device("cpu"), dtype=torch.float32, steps=3, amp="fp16"):
     t_len = len(take["lat"])
     horizon = min(int(seconds * fps), t_len - wm.CONTEXT - 1)
     if horizon < 1:
         return None
     if start is None:
         start = random.randint(0, t_len - wm.CONTEXT - horizon)
-    dream = rollout(model, take, start, horizon, device, steps)
+    dream = rollout(model, take, start, horizon, device, steps, amp)
     real = torch.from_numpy(take["lat"][start + wm.CONTEXT:start + wm.CONTEXT + horizon]).to(device)
     dream_img = decode(vae, dream, stats, dtype)
     real_img = decode(vae, real, stats, dtype)
@@ -106,6 +105,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("--clips", type=int, default=3)
     ap.add_argument("--steps", type=int, default=3, help="denoising steps per frame")
+    ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -123,7 +123,7 @@ def main():
         take = random.choice(data.takes)
         path = out / f"dream_step{ck['step']}_{c + 1}.mp4"
         m = make_dream_video(model, take, ck["stats"], vae, path, index["fps"], args.seconds,
-                             device=device, dtype=dtype, steps=args.steps)
+                             device=device, dtype=dtype, steps=args.steps, amp=args.amp)
         print(f"{path.name}: {m}")
 
 

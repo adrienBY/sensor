@@ -33,6 +33,7 @@ def main():
     ap.add_argument("checkpoint", type=Path)
     ap.add_argument("--steps", type=int, default=3, help="denoising steps (fewer = faster)")
     ap.add_argument("--scale", type=int, default=4, help="window size multiplier")
+    ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -52,7 +53,6 @@ def main():
         return torch.from_numpy(t["lat"][s:s + wm.CONTEXT])[None].to(device)
 
     ctx = reset()
-    use_amp = device.type == "cuda"
     win = "Dream (Q to quit)"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
     key = -1
@@ -80,7 +80,7 @@ def main():
         has_trans = 1.0 if np.any(trans) else 0.0
         a = torch.from_numpy(wm.action_vector(rot, trans, has_trans))[None].to(device)
         e = torch.tensor([event], device=device)
-        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+        with wm.autocast(device, args.amp):
             z = wm.sample_next(model, ctx, a, e, steps=args.steps)
         ctx = torch.cat([ctx[:, 1:], z[:, None].float()], dim=1)
         img = decode(vae, z, ck["stats"], dtype)[0]

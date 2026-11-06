@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 1
+LAUNCHER_VERSION = 2
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -35,7 +35,8 @@ ROCM_SDK = [
 ]
 TORCH = [ROCM + "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"]
 EXTRA = ["numpy", "opencv-python", "diffusers", "safetensors", "accelerate"]
-DEFAULT_SETTINGS = {"train_minutes": 60, "fps": 15, "width": 256, "height": 144}
+DEFAULT_SETTINGS = {"train_minutes": 60, "fps": 15, "width": 256, "height": 144,
+                    "amp": "fp16", "batch": 64, "tunableop": False}
 
 FROZEN = getattr(sys, "frozen", False)
 BUNDLE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -119,6 +120,7 @@ def setup_runtime():
         return py
     header("First-time setup: installing Python and PyTorch for your AMD GPU")
     say("This downloads a few GB once. It can take 10-30 minutes depending on your connection.")
+    amd_setup_notes()
     RUNTIME.mkdir(parents=True, exist_ok=True)
     uv = uv_exe()
     env = {"UV_PYTHON_INSTALL_DIR": str(RUNTIME / "python"),
@@ -150,10 +152,50 @@ def setup_runtime():
     return py
 
 
-def gpu_ok(py):
-    out = subprocess.run([str(py), "-c", "import torch; print(torch.cuda.is_available())"],
-                         capture_output=True, text=True)
-    return out.stdout.strip().endswith("True")
+_GPU = {}
+
+
+def gpu_name(py):
+    """The GPU PyTorch sees, or None (no GPU, or PyTorch failed to load). Cached."""
+    if str(py) in _GPU:
+        return _GPU[str(py)]
+    code = ("import torch; print('GPU=' + (torch.cuda.get_device_name(0) "
+            "if torch.cuda.is_available() else ''))")
+    out = subprocess.run([str(py), "-c", code], capture_output=True, text=True)
+    name = None
+    for line in out.stdout.splitlines():
+        if line.startswith("GPU="):
+            name = line[4:] or None
+    if name is None and "dll" in (out.stderr or "").lower():
+        say("PyTorch could not load one of its DLLs:")
+        say("  " + out.stderr.strip().splitlines()[-1][:300])
+    _GPU[str(py)] = name
+    return name
+
+
+def amd_setup_notes():
+    say("AMD's requirements for ROCm 7.2.1 on Windows: AMD Adrenalin driver 26.2.2 or newer.")
+    say("Note: AMD officially supports training with ROCm on WSL2 (Ubuntu), and lists training")
+    say("on native Windows as not yet supported. This program trains on native Windows; if")
+    say("training misbehaves, WSL2 is the officially supported fallback.")
+
+
+def amd_troubleshooting():
+    say("AMD's troubleshooting steps for PyTorch with ROCm on Windows:")
+    say("  1. update the AMD Adrenalin driver to 26.2.2 or newer and restart;")
+    say("  2. install the Microsoft Visual C++ 2015-2022 Redistributable (x64), which fixes")
+    say("     missing .dll errors;")
+    say("  3. AMD's install guide says Smart App Control and Microsoft Defender Application")
+    say("     Guard must be off for ROCm (Windows Security > App & browser control);")
+    say("  4. run WorldModel.exe again.")
+
+
+def env_for(s):
+    """Environment for training and dreaming: TunableOp when the benchmark chose it."""
+    if not s.get("tunableop"):
+        return {"PYTORCH_TUNABLEOP_ENABLED": "0"}
+    return {"PYTORCH_TUNABLEOP_ENABLED": "1", "PYTORCH_TUNABLEOP_TUNING": "1",
+            "PYTORCH_TUNABLEOP_FILENAME": str(RUNTIME / "tunableop_results.csv")}
 
 
 def install_scripts():
@@ -172,8 +214,12 @@ def settings():
         except ValueError:
             say("settings.json is not valid JSON; using defaults")
     else:
-        path.write_text(json.dumps(s, indent=2))
+        save_settings(s)
     return s
+
+
+def save_settings(s):
+    (HOME / "settings.json").write_text(json.dumps(s, indent=2))
 
 
 # ---------------------------------------------------------------------------------------
@@ -203,9 +249,9 @@ def import_footage(paths):
     return added
 
 
-def step(py, title, script, *args):
+def step(py, title, script, *args, env=None):
     header(title)
-    code = run([py, APP / script, *args], cwd=APP)
+    code = run([py, APP / script, *args], env_extra=env, cwd=APP)
     if code != 0:
         say(f"\n{title} failed (exit code {code}). The log is in {LOGS}.")
         return False
@@ -223,10 +269,38 @@ def process(py, s):
     return step(py, "3/3  Encoding frames into latents (GPU)", "encode_latents.py", PROCESSED)
 
 
+def tune(py, s):
+    """Benchmark once per GPU: the fastest precision, batch size and TunableOp on this card.
+    Delete "tuned_gpu" from settings.json to measure again."""
+    gpu = gpu_name(py)
+    if not gpu or s.get("tuned_gpu") == gpu:
+        return s
+    out = RUNTIME / "bench.json"
+    if out.exists():
+        out.unlink()
+    ok = step(py, f"Measuring the fastest training settings on your {gpu} (a few minutes, once)",
+              "bench.py", "--out", out, "--cache-dir", RUNTIME)
+    if ok and out.exists():
+        b = json.loads(out.read_text())
+        s.update({"amp": b["amp"], "batch": b["batch"], "tunableop": b["tunableop"],
+                  "tuned_samples_per_s": b["samples_per_s"]})
+        say(f"Saved to settings.json: {b['amp']}, batch {b['batch']}, "
+            f"TunableOp {'on' if b['tunableop'] else 'off'}")
+    else:
+        say(f"Using safe defaults ({s['amp']}, batch {s['batch']}, TunableOp off). To measure "
+            'again, delete the "tuned_gpu" line from settings.json.')
+        s["tunableop"] = False
+    s["tuned_gpu"] = gpu
+    save_settings(s)
+    return s
+
+
 def train(py, s, minutes=None):
     minutes = minutes or s["train_minutes"]
+    s = tune(py, s)
     ok = step(py, f"Training the world model for {minutes} minutes (Ctrl+C stops and saves)",
-              "train.py", PROCESSED, RUN, "--minutes", minutes)
+              "train.py", PROCESSED, RUN, "--minutes", minutes, "--amp", s["amp"],
+              "--batch", s["batch"], env=env_for(s))
     if ok and (RUN / "dreams").exists():
         say(f"\nDream videos: {RUN / 'dreams'}")
         open_folder(RUN / "dreams")
@@ -289,9 +363,10 @@ def menu(py, s):
                 continue
             if choice == "4":
                 step(py, "Walking in the dream: the window opens shortly", "play.py",
-                     PROCESSED, RUN / "last.pt")
+                     PROCESSED, RUN / "last.pt", "--amp", s["amp"], env=env_for(s))
             else:
-                if step(py, "Making dream videos", "dream.py", PROCESSED, RUN / "last.pt"):
+                if step(py, "Making dream videos", "dream.py", PROCESSED, RUN / "last.pt",
+                        "--amp", s["amp"], env=env_for(s)):
                     open_folder(RUN / "dreams")
         elif choice == "6":
             open_folder(HOME)
@@ -308,10 +383,12 @@ def main():
         s = settings()
         py = setup_runtime()
         install_scripts()
-        if not gpu_ok(py):
+        gpu = gpu_name(py)
+        if gpu:
+            say(f"GPU: {gpu}")
+        else:
             say("\nWARNING: PyTorch cannot see your AMD GPU, so training would run on the CPU.")
-            say("Update the AMD Adrenalin driver (26.2.2 or newer is required for ROCm 7.2.1),")
-            say("restart, and run WorldModel.exe again.")
+            amd_troubleshooting()
         dropped = [a for a in sys.argv[1:] if not a.startswith("-")]
         if dropped:
             import_footage(dropped)

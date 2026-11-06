@@ -83,6 +83,36 @@ class Dataset:
     def frames(self):
         return sum(len(t["lat"]) for t in self.takes)
 
+    def to_device(self, device):
+        """Move the whole split to the GPU once, so batches are built there with no CPU work
+        or host-to-device copies per step (an hour of footage is ~125 MB in FP16)."""
+        lat, act, ev, starts = [], [], [], []
+        offset = 0
+        for t in self.takes:
+            n = len(t["lat"])
+            lat.append(t["lat"].astype(np.float16))
+            a = np.zeros((n, ACTION_DIM), np.float32)
+            a[:n - 1] = t["act"]                       # action i = step from frame i to i+1
+            act.append(a)
+            e = np.zeros(n, np.int64)
+            e[:n - 1] = t["ev"]
+            ev.append(e)
+            starts.append(np.arange(offset, offset + n - CONTEXT))   # windows stay in one take
+            offset += n
+        self.g_lat = torch.from_numpy(np.concatenate(lat)).to(device)
+        self.g_act = torch.from_numpy(np.concatenate(act)).to(device)
+        self.g_ev = torch.from_numpy(np.concatenate(ev)).to(device)
+        self.g_starts = torch.from_numpy(np.concatenate(starts)).to(device)
+        self.g_window = torch.arange(CONTEXT + 1, device=device)
+        return self
+
+    def gpu_batch(self, n):
+        """Random training windows, built entirely on the device."""
+        s = self.g_starts[torch.randint(len(self.g_starts), (n,), device=self.g_starts.device)]
+        win = self.g_lat[s[:, None] + self.g_window].float()      # [n, CONTEXT+1, C, H, W]
+        last = s + CONTEXT - 1
+        return win[:, :CONTEXT], win[:, CONTEXT], self.g_act[last], self.g_ev[last]
+
     def batch(self, n, device):
         ctx, tgt, act, ev = [], [], [], []
         picks = np.random.choice(len(self.takes), size=n, p=self.weights)
@@ -148,7 +178,10 @@ class WorldDiT(nn.Module):
         self.config = dict(latent_shape=list(latent_shape), dim=dim, depth=depth, heads=heads,
                            patch=patch, n_events=n_events)
         self.ch, self.h, self.w, self.p = ch, h, w, patch
-        self.embed = nn.Conv2d(ch * (CONTEXT + 1), dim, patch, patch)
+        # Patch embedding as reshape + Linear (the same maths as a stride-`patch` conv): every
+        # matrix multiply in the network is then a GEMM for hipBLASLt, which TunableOp tunes,
+        # and none goes through MIOpen's convolution solvers.
+        self.embed = nn.Linear(ch * (CONTEXT + 1) * patch * patch, dim)
         self.pos = nn.Parameter(torch.randn(1, (h // patch) * (w // patch), dim) * 0.02)
         self.noise_mlp = nn.Sequential(nn.Linear(128, dim), nn.SiLU(), nn.Linear(dim, dim))
         self.ctx_noise_mlp = nn.Sequential(nn.Linear(128, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -162,10 +195,17 @@ class WorldDiT(nn.Module):
             nn.init.zeros_(m.weight)
             nn.init.zeros_(m.bias)
 
+    def patchify(self, x):
+        """[B, C, H, W] -> [B, tokens, C*p*p], in the same order as a stride-p conv."""
+        b, c, h, w = x.shape
+        p = self.p
+        x = x.view(b, c, h // p, p, w // p, p).permute(0, 2, 4, 1, 3, 5)
+        return x.reshape(b, (h // p) * (w // p), c * p * p)
+
     def forward(self, x, ctx, c_noise, ctx_sigma, action, event):
         b = x.shape[0]
         inp = torch.cat([ctx.flatten(1, 2), x], dim=1)
-        t = self.embed(inp).flatten(2).transpose(1, 2) + self.pos
+        t = self.embed(self.patchify(inp)) + self.pos
         c = (self.noise_mlp(fourier(c_noise)) + self.ctx_noise_mlp(fourier(ctx_sigma))
              + self.act_mlp(action) + self.event(event.clamp(0, self.event.num_embeddings - 1)))
         for blk in self.blocks:
@@ -230,6 +270,31 @@ def sample_next(model, ctx, act, ev, steps=3, ctx_noise=0.05, sigma_min=0.002, s
 
 
 # ---------------------------------------------------------------------------------------
+# Precision. AMD's ROCm support matrix for Radeon validates FP32, FP16 and FP16 mixed
+# precision, so FP16 autocast is the default; BF16 also runs on RDNA 4 and is kept as an option.
+
+AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": None}
+
+
+def autocast(device, amp="fp16"):
+    dtype = AMP_DTYPES.get(amp)
+    enabled = device.type == "cuda" and dtype is not None
+    return torch.autocast(device.type, dtype=dtype or torch.float32, enabled=enabled)
+
+
+def gpu_report():
+    """One line describing the GPU stack, for logs."""
+    if not torch.cuda.is_available():
+        return f"torch {torch.__version__}, no GPU"
+    p = torch.cuda.get_device_properties(0)
+    arch = getattr(p, "gcnArchName", "")
+    hip = getattr(torch.version, "hip", None)
+    stack = f"ROCm/HIP {hip}" if hip else f"CUDA {torch.version.cuda}"
+    return (f"{p.name} {arch} · {p.total_memory / 2**30:.1f} GB · {p.multi_processor_count} CUs · "
+            f"torch {torch.__version__} · {stack}")
+
+
+# ---------------------------------------------------------------------------------------
 # Checkpoints
 
 def save_checkpoint(path: Path, model, ema, opt, step, stats, vocab, minutes):
@@ -242,11 +307,21 @@ def save_checkpoint(path: Path, model, ema, opt, step, stats, vocab, minutes):
     tmp.replace(path)
 
 
+def upgrade_state_dict(sd):
+    """Checkpoints from before the patch embedding became a Linear layer: same weights,
+    flattened from conv layout [dim, C, p, p] to [dim, C*p*p]."""
+    w = sd.get("embed.weight")
+    if w is not None and w.dim() == 4:
+        sd = dict(sd)
+        sd["embed.weight"] = w.reshape(w.shape[0], -1)
+    return sd
+
+
 def load_model(path: Path, device, use_ema=True):
     ck = torch.load(path, map_location=device, weights_only=False)
     cfg = dict(ck["config"])
     model = WorldDiT(tuple(cfg.pop("latent_shape")), **cfg).to(device)
-    model.load_state_dict(ck["ema"] if use_ema else ck["model"])
+    model.load_state_dict(upgrade_state_dict(ck["ema"] if use_ema else ck["model"]))
     model.eval()
     return model, ck
 

@@ -35,8 +35,8 @@ D:\worldmodel\
 ## One-time setup (Windows 11)
 
 1. Install Python 3.12 from python.org (tick "Add to PATH").
-2. Install AMD's PyTorch-on-Windows driver (Adrenalin 26.1.1 or newer), then PyTorch for ROCm
-   following AMD's guide:
+2. Install the AMD Adrenalin driver 26.2.2 or newer (needed by ROCm 7.2.1), then PyTorch for
+   ROCm following AMD's guide:
    https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/install/installrad/windows/install-pytorch.html
 3. Then, in PowerShell:
 
@@ -44,7 +44,7 @@ D:\worldmodel\
 cd D:\worldmodel
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-pip install numpy opencv-python diffusers
+pip install numpy opencv-python diffusers safetensors accelerate
 ```
 
 (Install PyTorch into this same venv in step 2.) Check the GPU is visible:
@@ -53,7 +53,10 @@ pip install numpy opencv-python diffusers
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-It should print `True` and the RX 9070. PyTorch calls AMD GPUs "cuda" too.
+It should print `True` and the RX 9070. PyTorch calls AMD GPUs "cuda" too. If it prints
+`False` or a .dll error, AMD's troubleshooting steps are: driver 26.2.2 or newer, the Microsoft
+Visual C++ 2015-2022 Redistributable (x64), and Smart App Control and Microsoft Defender
+Application Guard turned off.
 
 ## Every time you bring footage over
 
@@ -101,3 +104,46 @@ python sensor\pipeline\train.py data\processed runs\main --minutes 60
 python sensor\pipeline\dream.py data\processed runs\main\last.pt
 python sensor\pipeline\play.py data\processed runs\main\last.pt
 ```
+
+## Tuned for RDNA 4 (RX 9070)
+
+What AMD's ROCm guidance recommends, and what the code does about it:
+
+- **FP16 mixed precision with loss scaling** (`--amp fp16`, the default). AMD's support matrix
+  for Radeon validates FP32, FP16 and FP16 mixed precision. RDNA 4's matrix units (WMMA) also run
+  BF16, so `--amp bf16` exists, but the benchmark only picks it if it is clearly faster (>5%).
+- **TunableOp**, PyTorch's GEMM auto-tuner for ROCm, which AMD recommends: for every matrix
+  shape the model uses, it times the available hipBLASLt and rocBLAS kernels and keeps the
+  fastest. Results are cached in `.runtime\tunableop_results0.csv` and reused.
+- **Only GEMMs**: the patch embedding is a reshape + Linear layer (the same maths as the
+  stride-2 convolution it replaces), so every matrix multiply goes to hipBLASLt, where
+  TunableOp can tune it, and none goes through MIOpen. Older checkpoints still load.
+- **Sizes that tile well**: width 384 (6 heads of 64), MLP 1536, 144 tokens per frame, batches
+  of 64 or more. All are multiples of WMMA's 16x16 tiles. `--dim` must be a multiple of 64.
+- **No CPU in the loop**: the whole dataset sits on the GPU in FP16 (an hour of footage is about
+  125 MB) and batches are sampled there. The loss is read back every 30 s, not every step, so
+  the GPU never waits for Python.
+- **Fewer, bigger kernels**: fused AdamW, which also lets the FP16 loss scaler skip its
+  per-step GPU-to-CPU check, and one multi-tensor EMA update.
+- **Settings measured on your card**: `bench.py` tries FP16 and BF16 at batch 64, 128 and 256,
+  then the best with TunableOp on, and WorldModel.exe stores the winner in `settings.json`
+  (`amp`, `batch`, `tunableop`). It runs once per GPU; delete `tuned_gpu` there to re-run it.
+  The learning rate scales with the square root of the batch size.
+- **torch.compile** needs Triton, which ROCm for Windows does not ship, so `--compile` only
+  does something on Linux or WSL2.
+- **Native Windows vs WSL2**: AMD officially supports the RX 9070 with PyTorch 2.9.1 and
+  ROCm 7.2.1 on WSL2, training included. On native Windows, AMD lists training as not yet
+  supported. WorldModel.exe trains natively; if training misbehaves there, WSL2 is the
+  officially supported fallback.
+
+Running the same thing by hand:
+
+```
+python sensor\pipeline\bench.py --out bench.json --cache-dir .
+$env:PYTORCH_TUNABLEOP_ENABLED = "1"; $env:PYTORCH_TUNABLEOP_TUNING = "1"
+$env:PYTORCH_TUNABLEOP_FILENAME = "D:\worldmodel\tunableop_results.csv"
+python sensor\pipeline\train.py data\processed runs\main --minutes 60 --amp fp16 --batch 128
+```
+
+(Use the `amp` and `batch` that `bench.json` reports, and drop the three `$env:` settings if it
+says TunableOp did not help.)
