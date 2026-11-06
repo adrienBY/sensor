@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer ring -->
+    <path
+        android:pathData="M54,28a26,26 0,1 1,0 52a26,26 0,1 1,0 -52z"
+        android:strokeWidth="4"
+        android:strokeColor="#F2F2F4"
+        android:fillColor="#00000000" />
+    <!-- Record dot -->
+    <path
+        android:pathData="M54,42a12,12 0,1 1,0 24a12,12 0,1 1,0 -24z"
+        android:fillColor="#E5383B" />
+    <!-- Motion ticks -->
+    <path
+        android:pathData="M24,54h-6M90,54h6M54,24v-6M54,84v6"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:strokeColor="#5BD17A" />
+</vector>

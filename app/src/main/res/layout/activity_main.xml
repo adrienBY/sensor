@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/root"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/bg"
+    android:orientation="horizontal">
+
+    <!-- Camera preview with the live status overlay -->
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <androidx.camera.view.PreviewView
+            android:id="@+id/preview"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent" />
+
+        <LinearLayout
+            android:id="@+id/statusBox"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|start"
+            android:layout_margin="12dp"
+            android:background="@drawable/panel_bg"
+            android:orientation="vertical"
+            android:padding="10dp">
+
+            <TextView
+                android:id="@+id/recText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="@string/ready"
+                android:textColor="@color/text"
+                android:textSize="18sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/statsText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:fontFamily="monospace"
+                android:textColor="@color/text_dim"
+                android:textSize="11sp" />
+
+            <TextView
+                android:id="@+id/motionText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="2dp"
+                android:textColor="@color/ok"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <!-- Control panel -->
+    <ScrollView
+        android:layout_width="290dp"
+        android:layout_height="match_parent"
+        android:background="@color/panel"
+        android:fillViewport="true">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="12dp">
+
+            <LinearLayout
+                android:id="@+id/setupGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical">
+
+                <TextView style="@style/Label" android:text="@string/room" />
+                <Spinner
+                    android:id="@+id/roomSpinner"
+                    android:layout_width="match_parent"
+                    android:layout_height="40dp" />
+
+                <TextView style="@style/Label" android:text="@string/light" />
+                <Spinner
+                    android:id="@+id/lightSpinner"
+                    android:layout_width="match_parent"
+                    android:layout_height="40dp" />
+
+                <TextView style="@style/Label" android:text="@string/take" />
+                <Spinner
+                    android:id="@+id/typeSpinner"
+                    android:layout_width="match_parent"
+                    android:layout_height="40dp" />
+
+                <CheckBox
+                    android:id="@+id/lockFocus"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:text="@string/lock_focus"
+                    android:textColor="@color/text" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/recordButton"
+                android:layout_width="match_parent"
+                android:layout_height="64dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/rec_idle"
+                android:text="@string/record"
+                android:textAllCaps="false"
+                android:textColor="@color/text"
+                android:textSize="20sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/savingText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="6dp"
+                android:textColor="@color/text_dim"
+                android:textSize="12sp" />
+
+            <TextView style="@style/Label" android:text="@string/object" />
+            <GridLayout
+                android:id="@+id/objectGrid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:columnCount="3" />
+
+            <TextView style="@style/Label" android:text="@string/action" />
+            <GridLayout
+                android:id="@+id/actionGrid"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:columnCount="3" />
+
+            <TextView
+                android:id="@+id/lastEventText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/no_tags"
+                android:textColor="@color/text_dim"
+                android:textSize="13sp" />
+
+            <Button
+                android:id="@+id/undoButton"
+                android:layout_width="match_parent"
+                android:layout_height="40dp"
+                android:layout_marginTop="4dp"
+                android:background="@drawable/btn_normal"
+                android:text="@string/undo"
+                android:textAllCaps="false"
+                android:textColor="@color/text" />
+
+            <TextView style="@style/Label" android:text="@string/coverage" />
+            <TextView
+                android:id="@+id/coverageText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:fontFamily="monospace"
+                android:textColor="@color/text_dim"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

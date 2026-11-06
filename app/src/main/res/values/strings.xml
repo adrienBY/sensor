@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sensor Capture</string>
+    <string name="ready">READY</string>
+    <string name="room">Room</string>
+    <string name="light">Lighting</string>
+    <string name="take">Take type</string>
+    <string name="lock_focus">Lock focus when recording starts</string>
+    <string name="record">● Record</string>
+    <string name="stop">■ Stop</string>
+    <string name="object">Object</string>
+    <string name="action">Action (tap the moment you do it)</string>
+    <string name="no_tags">No tags yet</string>
+    <string name="undo">Undo last tag</string>
+    <string name="coverage">Footage per room</string>
+</resources>
