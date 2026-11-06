@@ -146,17 +146,34 @@ def main():
         print(__doc__)
         sys.exit(1)
     root = Path(sys.argv[1])
-    sessions = [root] if (root / "meta.json").exists() else sorted(
-        p for p in root.iterdir() if p.is_dir()
-    )
+    # Sessions can sit at any depth (room/take-type/session), so find them by their meta.json.
+    sessions = sorted({p.parent for p in root.rglob("meta.json")})
+    if not sessions:
+        print(f"No sessions found under {root}")
+        sys.exit(1)
     results = [check(s) for s in sessions]
+
+    # Minutes per room and take type
+    table = defaultdict(lambda: defaultdict(float))
+    takes = set()
     total = 0.0
     for s in sessions:
         try:
-            total += json.loads((s / "meta.json").read_text()).get("video_duration_s", 0)
+            m = json.loads((s / "meta.json").read_text())
         except Exception:
-            pass
-    print(f"\n{sum(results)}/{len(results)} sessions OK, {total / 60:.1f} min of footage")
+            continue
+        minutes = m.get("video_duration_s", 0) / 60
+        table[m.get("room", "?")][m.get("take_type", "?")] += minutes
+        takes.add(m.get("take_type", "?"))
+        total += minutes
+    cols = sorted(takes)
+    print("\nMinutes of footage per room and take type")
+    print(f"  {'room':16s}" + "".join(f"{c[:12]:>13s}" for c in cols) + f"{'total':>9s}")
+    for room in sorted(table):
+        row = table[room]
+        print(f"  {room:16s}" + "".join(f"{row.get(c, 0):13.1f}" for c in cols)
+              + f"{sum(row.values()):9.1f}")
+    print(f"\n{sum(results)}/{len(results)} sessions OK, {total:.1f} min of footage")
 
 
 if __name__ == "__main__":

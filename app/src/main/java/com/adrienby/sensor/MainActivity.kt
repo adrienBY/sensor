@@ -472,14 +472,18 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("lockFocus", lockFocus.isChecked)
             .apply()
 
-        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val id = "${stamp}_${slug(room)}_${slug(take)}"
+        // Saved as SensorCapture/<room>/<take type>/<date_time>_<lighting>_<mode>/
+        val stamp = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.US).format(Date())
+        val id = "${stamp}_${slug(light)}_${if (arMode) "ar" else "video"}"
+        val folder = "${slug(room)}/${slug(take)}/$id"
         val dir = File(getExternalFilesDir(null), "sessions/$id")
         dir.mkdirs()
 
         val s = CaptureSession(dir, id)
+        s.exportPath = folder
         s.meta.apply {
             put("session", id)
+            put("folder", folder)
             put("room", room)
             put("lighting", light)
             put("take_type", take)
@@ -591,7 +595,7 @@ class MainActivity : AppCompatActivity() {
         io.execute {
             val result = try {
                 s.close()
-                val path = Exporter.export(this, s.dir, s.id) { pct ->
+                val path = Exporter.export(this, s.dir, s.exportPath) { pct ->
                     ui.post { savingText.text = "Saving… $pct%" }
                 }
                 s.dir.deleteRecursively()

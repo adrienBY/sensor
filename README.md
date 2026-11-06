@@ -8,7 +8,23 @@ Built by GitHub Actions on every push to `main`. The APK is attached to the late
 
 ## What one take produces
 
-Each take is saved to `Download/SensorCapture/<session>/` on the phone:
+Takes are sorted by room, then take type:
+
+```
+Download/SensorCapture/
+  corridor/
+    walkthrough/
+      2026-11-07_101530_daylight_ar/
+      2026-11-07_183002_evening-lights-on_ar/
+    transitions/
+  kitchen/
+    interactions/
+      2026-11-07_110415_daylight_video/
+  whole-apartment/
+    walkthrough/
+```
+
+Session folders are named `<date>_<time>_<lighting>_<mode>`. Each one holds:
 
 | File | Contents |
 | --- | --- |
@@ -33,8 +49,6 @@ ARCore poses use `Camera.getPose()`: world-from-camera, OpenGL camera axes (+X r
 −Z looking forward), metres, in a gravity-aligned world (+Y up) whose origin is where the AR
 session started. Each take therefore has its own origin; the PC pipeline registers takes together.
 `frames.csv` in AR mode holds the frame index, timestamp and texture intrinsics (fx, fy, cx, cy).
-
-Session names look like `20261107_101530_kitchen_walkthrough`.
 
 ## Clocks and alignment
 

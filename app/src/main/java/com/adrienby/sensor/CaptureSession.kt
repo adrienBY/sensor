@@ -25,6 +25,9 @@ class CaptureSession(val dir: File, val id: String) : ImuLogger.Sink {
 
     val meta = JSONObject()
 
+    /** Where the take goes under Download/SensorCapture/ (room/take-type/session). */
+    var exportPath: String = id
+
     private val imu = BufferedWriter(FileWriter(File(dir, "imu.csv")), 1 shl 17)
     private val frames = BufferedWriter(FileWriter(File(dir, "frames.csv")), 1 shl 16)
     private val eventLog = BufferedWriter(FileWriter(File(dir, "events.log.jsonl")))

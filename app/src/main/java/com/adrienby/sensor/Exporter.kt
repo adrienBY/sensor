@@ -9,14 +9,15 @@ import java.io.IOException
 
 /**
  * Copies a finished session from the app's private folder to the public
- * Download/SensorCapture/<session>/ folder, where a PC sees it over USB.
+ * Download/SensorCapture/<room>/<take type>/<session>/ folder, where a PC sees it over USB.
  */
 object Exporter {
 
-    fun export(context: Context, dir: File, sessionId: String, progress: (Int) -> Unit): String {
+    /** [subPath] is relative to Download/SensorCapture/, e.g. "kitchen/walkthrough/<session>". */
+    fun export(context: Context, dir: File, subPath: String, progress: (Int) -> Unit): String {
         val files = dir.listFiles()?.filter { it.isFile }?.sortedBy { it.length() } ?: emptyList()
         val total = files.sumOf { it.length() }.coerceAtLeast(1L)
-        val relPath = Environment.DIRECTORY_DOWNLOADS + "/SensorCapture/" + sessionId
+        val relPath = Environment.DIRECTORY_DOWNLOADS + "/SensorCapture/" + subPath
         val resolver = context.contentResolver
         var done = 0L
         var lastPct = -1
