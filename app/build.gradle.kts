@@ -63,4 +63,6 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-video:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    // 1.47 is the newest ARCore built against compileSdk 35 (later ones need 36+).
+    implementation("com.google.ar:core:1.47.0")
 }

@@ -18,6 +18,8 @@ import android.util.Range
 import android.view.HapticFeedbackConstants
 import android.view.View
 import android.view.WindowManager
+import android.opengl.GLSurfaceView
+import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
@@ -99,6 +101,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var undoButton: Button
     private lateinit var coverageText: TextView
     private lateinit var setupGroup: LinearLayout
+    private lateinit var modeSpinner: Spinner
+    private lateinit var arView: GLSurfaceView
     private val objectButtons = ArrayList<Button>()
     private val actionButtons = ArrayList<Button>()
 
@@ -108,7 +112,12 @@ class MainActivity : AppCompatActivity() {
     private var state = State.IDLE
     private var selectedObject = 0
     private var camera: Camera? = null
+    private var cameraProvider: ProcessCameraProvider? = null
     private var videoCapture: VideoCapture<Recorder>? = null
+    private lateinit var ar: ArCapture
+    private var arMode = false
+    private var isResumedNow = false
+    private val modes = listOf("Video only (CameraX)", "AR: video + camera position (ARCore)")
     private var recording: Recording? = null
     private var cameraMeta = JSONObject()
     private var cameraSettings = JSONObject()
@@ -168,6 +177,9 @@ class MainActivity : AppCompatActivity() {
         undoButton = findViewById(R.id.undoButton)
         coverageText = findViewById(R.id.coverageText)
         setupGroup = findViewById(R.id.setupGroup)
+        modeSpinner = findViewById(R.id.modeSpinner)
+        arView = findViewById(R.id.arView)
+        ar = ArCapture(this, arView)
 
         // Keep the panels clear of the front-camera cutout.
         val root = findViewById<View>(R.id.root)
@@ -191,6 +203,19 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
+        arMode = prefs.getInt("mode", 0) == 1
+        setupSpinner(modeSpinner, modes, if (arMode) 1 else 0)
+        modeSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                val wantAr = pos == 1
+                if (wantAr == arMode) return
+                arMode = wantAr
+                prefs.edit().putInt("mode", pos).apply()
+                applyMode()
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
+        }
         setupSpinner(roomSpinner, rooms, prefs.getInt("room", 0))
         setupSpinner(lightSpinner, lights, prefs.getInt("light", 0))
         setupSpinner(typeSpinner, takeTypes, prefs.getInt("type", 0))
@@ -229,12 +254,29 @@ class MainActivity : AppCompatActivity() {
         ui.post(tick)
     }
 
-    override fun onStop() {
+    override fun onResume() {
+        super.onResume()
+        isResumedNow = true
+        if (arMode && hasCameraPermission()) resumeAr()
+    }
+
+    override fun onPause() {
         // Leaving the app ends the take cleanly instead of losing it.
         if (state == State.RECORDING) stopRecording()
+        isResumedNow = false
+        ar.pause()
+        super.onPause()
+    }
+
+    override fun onStop() {
         ui.removeCallbacks(tick)
         imu.stop()
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        ar.close()
+        super.onDestroy()
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -247,7 +289,44 @@ class MainActivity : AppCompatActivity() {
 
     private fun startCamera() {
         val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({ bindCamera(future.get()) }, ContextCompat.getMainExecutor(this))
+        future.addListener({
+            cameraProvider = future.get()
+            applyMode()
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun hasCameraPermission() =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+
+    /** Hands the camera to CameraX (video mode) or ARCore (AR mode). */
+    private fun applyMode() {
+        if (!hasCameraPermission()) return
+        if (arMode) {
+            cameraProvider?.unbindAll()
+            camera = null
+            videoCapture = null
+            previewView.visibility = View.GONE
+            arView.visibility = View.VISIBLE
+            if (isResumedNow) resumeAr()
+        } else {
+            ar.pause()
+            arView.visibility = View.GONE
+            previewView.visibility = View.VISIBLE
+            val p = cameraProvider
+            if (p != null) bindCamera(p) else startCamera()
+        }
+    }
+
+    private fun resumeAr() {
+        when (val err = ar.resume()) {
+            null -> {}
+            "INSTALLING" -> recText.text = "Installing ARCore…"
+            else -> {
+                Toast.makeText(this, "$err. Back to video mode.", Toast.LENGTH_LONG).show()
+                modeSpinner.setSelection(0) // the listener switches back to CameraX
+            }
+        }
     }
 
     @OptIn(ExperimentalCamera2Interop::class)
@@ -374,8 +453,13 @@ class MainActivity : AppCompatActivity() {
     // Recording
 
     private fun startRecording() {
-        val vc = videoCapture ?: run {
+        val vc = videoCapture
+        if (!arMode && vc == null) {
             Toast.makeText(this, "Camera not ready yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (arMode && ar.session == null) {
+            Toast.makeText(this, "AR not running yet", Toast.LENGTH_SHORT).show()
             return
         }
         val room = rooms[roomSpinner.selectedItemPosition]
@@ -413,17 +497,38 @@ class MainActivity : AppCompatActivity() {
             put("clock", "elapsedRealtimeNanos")
             put("record_call_ns", SystemClock.elapsedRealtimeNanos())
             put("record_call_unix_ms", System.currentTimeMillis())
+            put("mode", if (arMode) "ar" else "video")
         }
 
-        // Start logging before the video starts, so no frame or IMU sample is missed.
-        activeSession = s
-        imu.sink = s
-        if (lockFocus.isChecked) lockFocusAtCenter()
+        if (arMode) {
+            // AR mode: ARCore records the video; poses arrive from the GL thread.
+            s.meta.put("camera", JSONObject())
+            s.meta.put("camera_settings", JSONObject().put("source", "ARCore Recording API"))
+            s.meta.put("ar_camera", ar.cameraInfo)
+            s.enablePoses()
+            activeSession = s
+            imu.sink = s
+            val err = ar.startRecording(s, File(dir, "video.mp4"))
+            if (err != null) {
+                activeSession = null
+                imu.sink = null
+                s.close()
+                dir.deleteRecursively()
+                Toast.makeText(this, err, Toast.LENGTH_LONG).show()
+                return
+            }
+            s.videoStartNs = SystemClock.elapsedRealtimeNanos()
+        } else {
+            // Start logging before the video starts, so no frame or IMU sample is missed.
+            activeSession = s
+            imu.sink = s
+            if (lockFocus.isChecked) lockFocusAtCenter()
 
-        val options = FileOutputOptions.Builder(File(dir, "video.mp4")).build()
-        recording = vc.output
-            .prepareRecording(this, options)
-            .start(ContextCompat.getMainExecutor(this)) { event -> onRecordEvent(event, s) }
+            val options = FileOutputOptions.Builder(File(dir, "video.mp4")).build()
+            recording = vc!!.output
+                .prepareRecording(this, options)
+                .start(ContextCompat.getMainExecutor(this)) { event -> onRecordEvent(event, s) }
+        }
 
         recStartedAt = SystemClock.elapsedRealtime()
         lastEventText.text = getString(R.string.no_tags)
@@ -431,6 +536,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun stopRecording() {
+        if (arMode) {
+            val s = activeSession
+            applyState(State.FINALIZING)
+            val err = ar.stopRecording() // returns once the MP4 is finalized
+            activeSession = null
+            if (imu.sink === s) imu.sink = null
+            if (s == null) {
+                applyState(State.IDLE)
+                return
+            }
+            val endNs = SystemClock.elapsedRealtimeNanos()
+            val durationS = (endNs - s.videoStartNs) / 1e9
+            s.putMeta("video_finalize_ns", endNs)
+            s.putMeta("video_duration_s", durationS)
+            s.putMeta("video_error", if (err == null) 0 else 1)
+            if (err != null) s.putMeta("video_error_message", err)
+            saveSession(s, durationS)
+            return
+        }
         recording?.stop()
         recording = null
         applyState(State.FINALIZING)
@@ -518,7 +642,7 @@ class MainActivity : AppCompatActivity() {
         val now = SystemClock.elapsedRealtime()
         if (now - lastStatsAt >= 1000) {
             val dt = (now - lastStatsAt).coerceAtLeast(1) / 1000.0
-            val frames = frameCounter.get()
+            val frames = frameCounter.get() + ar.frameCounter.get()
             val fps = (frames - lastFrameCount) / dt
             lastFrameCount = frames
             val hz = IntArray(4)
@@ -538,8 +662,11 @@ class MainActivity : AppCompatActivity() {
             )
         }
         val s = activeSession
-        statsText.text = if (s != null && state == State.RECORDING)
-            "$statsLine · frames ${s.frameCount} · imu ${s.imuCount}" else statsLine
+        val counts = if (s != null && state == State.RECORDING) {
+            val p = if (arMode) " · poses ${s.poseCount}" else ""
+            " · frames ${s.frameCount} · imu ${s.imuCount}$p"
+        } else ""
+        statsText.text = statsLine + counts
 
         if (state == State.RECORDING) {
             val sec = (now - recStartedAt) / 1000
@@ -549,6 +676,11 @@ class MainActivity : AppCompatActivity() {
 
         val speed = imu.rotationSpeed
         when {
+            arMode && !ar.tracking -> {
+                // Lost tracking matters more than speed: those frames get no position.
+                motionText.text = ar.trackingText
+                motionText.setTextColor(ContextCompat.getColor(this, R.color.rec))
+            }
             speed > 1.4 -> {
                 motionText.text = "Too fast, slow down"
                 motionText.setTextColor(ContextCompat.getColor(this, R.color.rec))
@@ -558,7 +690,7 @@ class MainActivity : AppCompatActivity() {
                 motionText.setTextColor(ContextCompat.getColor(this, R.color.warn))
             }
             else -> {
-                motionText.text = "Motion OK"
+                motionText.text = if (arMode) "Motion OK · AR tracking" else "Motion OK"
                 motionText.setTextColor(ContextCompat.getColor(this, R.color.ok))
             }
         }

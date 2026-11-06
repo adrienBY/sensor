@@ -10,6 +10,7 @@ compares the video's frame count with the camera frame log.
 """
 import csv
 import json
+import math
 import shutil
 import statistics
 import subprocess
@@ -88,6 +89,34 @@ def check(session: Path) -> bool:
             print("  WARNING: IMU does not cover the whole video (clock mismatch?)")
     src = meta.get("camera", {}).get("timestamp_source")
     print(f"  camera timestamp source: {src}")
+
+    # ARCore poses (AR mode only)
+    poses_path = session / "poses.csv"
+    if poses_path.exists():
+        rows = list(csv.DictReader(open(poses_path, newline="")))
+        tracked = [r for r in rows if r["tracking"] == "TRACKING"]
+        pct = 100 * len(tracked) / max(1, len(rows))
+        path_m = 0.0
+        prev = None
+        for r in tracked:
+            p = (float(r["tx"]), float(r["ty"]), float(r["tz"]))
+            if prev:
+                path_m += math.dist(prev, p)
+            prev = p
+        print(f"  ARCore poses {len(rows)}, tracking {pct:.0f}%, walked {path_m:.1f} m")
+        if pct < 90:
+            reasons = defaultdict(int)
+            for r in rows:
+                if r["tracking"] != "TRACKING":
+                    reasons[r["failure_reason"]] += 1
+            print(f"  WARNING: tracking lost on {100 - pct:.0f}% of frames: {dict(reasons)}")
+        if tracked:
+            xs = [float(r["tx"]) for r in tracked]
+            zs = [float(r["tz"]) for r in tracked]
+            print(f"  floor extent {max(xs) - min(xs):.1f} m x {max(zs) - min(zs):.1f} m")
+    elif meta.get("mode") == "ar":
+        print("  WARNING: AR session without poses.csv")
+        ok = False
 
     # Events
     ev = json.loads((session / "events.json").read_text())

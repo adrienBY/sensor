@@ -17,7 +17,22 @@ Each take is saved to `Download/SensorCapture/<session>/` on the phone:
 | `frames.csv` | One row per camera frame: frame number, sensor timestamp, exposure, ISO, focus distance, focal length and per-frame intrinsics (fx, fy, cx, cy, skew) when the phone reports them |
 | `events.json` | Interaction tags after undo: `{t_ns, t_video_s, object, action}` |
 | `events.log.jsonl` | Raw tag log written as you tap, including undos (crash-safe) |
-| `meta.json` | Room, lighting, take type, device, camera calibration, sensor list, clock anchors, counts |
+| `meta.json` | Room, lighting, take type, mode, device, camera calibration, sensor list, clock anchors, counts |
+| `poses.csv` | **AR mode only.** One row per camera frame: `timestamp_ns,tracking,failure_reason,tx,ty,tz,qx,qy,qz,qw` |
+
+## Two modes
+
+- **Video only (CameraX)**: the original mode. 1080p, stabilization off, rich per-frame camera
+  metadata (exposure, ISO, focus). Camera positions are computed later on the PC.
+- **AR (ARCore)**: ARCore owns the camera and tracks the phone in 3D while recording. The video is
+  written by ARCore's Recording API at the largest 30 fps resolution ARCore offers (see
+  `meta.json → ar_camera.texture_size`). Its MP4 also contains ARCore's own data tracks; the
+  camera image is the first video stream (`ffmpeg -map 0:v:0`).
+
+ARCore poses use `Camera.getPose()`: world-from-camera, OpenGL camera axes (+X right, +Y up,
+−Z looking forward), metres, in a gravity-aligned world (+Y up) whose origin is where the AR
+session started. Each take therefore has its own origin; the PC pipeline registers takes together.
+`frames.csv` in AR mode holds the frame index, timestamp and texture intrinsics (fx, fy, cx, cy).
 
 Session names look like `20261107_101530_kitchen_walkthrough`.
 

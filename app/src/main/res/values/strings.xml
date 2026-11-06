@@ -2,6 +2,7 @@
 <resources>
     <string name="app_name">Sensor Capture</string>
     <string name="ready">READY</string>
+    <string name="mode">Mode</string>
     <string name="room">Room</string>
     <string name="light">Lighting</string>
     <string name="take">Take type</string>

@@ -17,6 +17,12 @@
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
 
+        <android.opengl.GLSurfaceView
+            android:id="@+id/arView"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone" />
+
         <LinearLayout
             android:id="@+id/statusBox"
             android:layout_width="wrap_content"
@@ -74,6 +80,12 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:orientation="vertical">
+
+                <TextView style="@style/Label" android:text="@string/mode" />
+                <Spinner
+                    android:id="@+id/modeSpinner"
+                    android:layout_width="match_parent"
+                    android:layout_height="40dp" />
 
                 <TextView style="@style/Label" android:text="@string/room" />
                 <Spinner

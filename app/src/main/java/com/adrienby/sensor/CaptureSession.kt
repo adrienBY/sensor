@@ -29,6 +29,10 @@ class CaptureSession(val dir: File, val id: String) : ImuLogger.Sink {
     private val frames = BufferedWriter(FileWriter(File(dir, "frames.csv")), 1 shl 16)
     private val eventLog = BufferedWriter(FileWriter(File(dir, "events.log.jsonl")))
 
+    private var poses: BufferedWriter? = null
+    var poseCount = 0L
+        private set
+
     private val events = ArrayList<JSONObject>()
     private val sb = StringBuilder(128)
     private var closed = false
@@ -92,6 +96,45 @@ class CaptureSession(val dir: File, val id: String) : ImuLogger.Sink {
         frameCount++
     }
 
+    /** AR mode: opens poses.csv. */
+    @Synchronized
+    fun enablePoses() {
+        if (poses != null || closed) return
+        val w = BufferedWriter(FileWriter(File(dir, "poses.csv")), 1 shl 16)
+        w.write("timestamp_ns,tracking,failure_reason,tx,ty,tz,qx,qy,qz,qw\n")
+        poses = w
+    }
+
+    /**
+     * AR mode: one ARCore frame. [pose] = tx,ty,tz,qx,qy,qz,qw (world-from-camera, metres),
+     * [k] = fx,fy,cx,cy of the camera texture. Also writes the matching frames.csv row.
+     */
+    @Synchronized
+    fun writeArFrame(ts: Long, tracking: String, failure: String, pose: FloatArray, k: FloatArray) {
+        if (closed) return
+        if (firstFrameNs < 0) firstFrameNs = ts
+        lastFrameNs = ts
+        poses?.let { w ->
+            sb.setLength(0)
+            sb.append(ts).append(',').append(tracking).append(',').append(failure)
+            for (v in pose) sb.append(',').append(v)
+            sb.append('\n')
+            w.write(sb.toString())
+            poseCount++
+        }
+        sb.setLength(0)
+        sb.append(frameCount).append(',').append(ts).append(",,,,")
+        for (v in k) sb.append(',').append(v)
+        sb.append(",0\n")
+        frames.write(sb.toString())
+        frameCount++
+    }
+
+    @Synchronized
+    fun putMeta(key: String, value: Any) {
+        meta.put(key, value)
+    }
+
     /** Returns the stored tag so the UI can show it. */
     @Synchronized
     fun addEvent(obj: String, action: String, nowNs: Long): JSONObject {
@@ -134,6 +177,7 @@ class CaptureSession(val dir: File, val id: String) : ImuLogger.Sink {
         imu.flush(); imu.close()
         frames.flush(); frames.close()
         eventLog.flush(); eventLog.close()
+        poses?.let { it.flush(); it.close() }
 
         val ev = JSONObject()
         ev.put("session", id)
@@ -144,6 +188,7 @@ class CaptureSession(val dir: File, val id: String) : ImuLogger.Sink {
 
         meta.put("imu_samples", imuCount)
         meta.put("frames_logged", frameCount)
+        if (poses != null) meta.put("poses_logged", poseCount)
         meta.put("first_frame_ns", firstFrameNs)
         meta.put("last_frame_ns", lastFrameNs)
         meta.put("video_start_ns", videoStartNs)
