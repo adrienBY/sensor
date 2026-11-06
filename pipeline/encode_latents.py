@@ -16,6 +16,7 @@ opencv-python. "cuda" is the device name PyTorch uses for AMD GPUs too.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 
 import cv2
@@ -23,7 +24,8 @@ import numpy as np
 import torch
 from diffusers import AutoencoderTiny
 
-MODEL_ID = "madebyollin/taesd"
+# WORLDMODEL_TAESD can point at a local copy of the model (offline use, tests).
+MODEL_ID = os.environ.get("WORLDMODEL_TAESD", "madebyollin/taesd")
 
 
 @torch.no_grad()
@@ -39,7 +41,7 @@ def encode_take(vae, take: Path, device, dtype, batch: int, force: bool):
         raise ValueError(f"frame size {w}x{h} must be divisible by 8")
     latents = np.zeros((t, 4, h // 8, w // 8), dtype=np.float16)
     for i in range(0, t, batch):
-        x = torch.from_numpy(np.ascontiguousarray(frames[i:i + batch])).to(device)
+        x = torch.from_numpy(np.array(frames[i:i + batch])).to(device)   # copy out of the memory map
         x = x.permute(0, 3, 1, 2).to(dtype) / 127.5 - 1.0     # [-1, 1], as diffusers expects
         latents[i:i + len(x)] = vae.encode(x).latents.float().cpu().numpy().astype(np.float16)
     np.save(out, latents)
