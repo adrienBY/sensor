@@ -1,7 +1,24 @@
 # PC pipeline
 
-Turns the `SensorCapture` folder from the phone into training-ready data. Three steps, each
-safe to re-run: takes that are already done are skipped.
+## The easy way: WorldModel.exe
+
+1. Download `WorldModel.exe` from the latest release and put it in its own folder, e.g.
+   `D:\WorldModel\`. Everything it makes stays in that folder.
+2. Copy `SensorCapture` from the phone to the PC (drag-and-drop straight from the phone over
+   USB does not give Windows a real path, so copy it first).
+3. Drag the `SensorCapture` folder onto `WorldModel.exe`.
+
+The first run installs Python 3.12 and AMD's PyTorch for ROCm 7.2.1 into `.runtime\` (a few GB,
+10–30 min, once). It needs AMD Adrenalin driver 26.2.2 or newer. Then it imports the new takes,
+checks, aligns and encodes them, trains for `train_minutes` (60 by default, edit
+`settings.json`), and opens the folder of dream videos. Run it again with more footage and it
+continues training from where it stopped. Double-click it (no folder) for a menu: train more,
+make dream videos, or walk in the dream with the keyboard (`play.py`). Windows may warn that the
+.exe is unrecognised (it is not code-signed): click "More info" → "Run anyway".
+
+## The manual way
+
+The steps below are what the .exe runs. Each is safe to re-run: takes already done are skipped.
 
 ```
 D:\worldmodel\
@@ -68,3 +85,19 @@ For each step from frame t to t+1: `rot` (3 numbers, how the camera turned, radi
 takes, `trans` (3 numbers, how it moved, metres), both in the camera's own frame at t
 (+X right, +Y up, looking along −Z). `event` is the interaction tag that happened in that step.
 That 6-number action plus the tag is what the world model is conditioned on.
+
+## The model (train.py)
+
+`worldmodel.py` holds a small diffusion transformer (about 22M parameters) that predicts the next
+latent frame from the previous 4 and the action between them. It follows DIAMOND's recipe: EDM
+diffusion, 3 denoising steps per frame, and noise added to the past frames during training so
+the model learns to recover from its own mistakes when it dreams. Training is time-budgeted and
+resumable (`runs/main/last.pt`), keeps an EMA copy for dreaming, and every 20 minutes writes a
+video to `runs/main/dreams/`: real footage on the left, the model's own rollout on the right.
+`metrics.jsonl` logs PSNR between them at 1, 3 and 10 seconds.
+
+```
+python sensor\pipeline\train.py data\processed runs\main --minutes 60
+python sensor\pipeline\dream.py data\processed runs\main\last.pt
+python sensor\pipeline\play.py data\processed runs\main\last.pt
+```
