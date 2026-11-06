@@ -68,7 +68,8 @@ class MainActivity : AppCompatActivity() {
 
     // ---- choices shown in the panel -------------------------------------------------------
     private val rooms = listOf(
-        "Hallway", "Living room", "Kitchen", "Bedroom", "Bathroom", "Office", "Balcony", "Other"
+        "Corridor", "Living room", "Kitchen", "My room", "Bathroom", "Parents' room",
+        "Whole apartment", "Other"
     )
     private val lights = listOf(
         "Daylight", "Evening, lights on", "Night, lights on", "Night, lights off", "Mixed"
