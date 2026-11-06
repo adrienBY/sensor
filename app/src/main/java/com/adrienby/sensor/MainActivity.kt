@@ -38,6 +38,8 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FallbackStrategy
 import androidx.camera.video.FileOutputOptions
@@ -268,7 +270,12 @@ class MainActivity : AppCompatActivity() {
         }
         cameraMeta = if (c2 != null) describeCamera(c2) else JSONObject()
 
-        val previewBuilder = Preview.Builder()
+        // 16:9 preview so the framing on screen matches the 16:9 video exactly.
+        val previewBuilder = Preview.Builder().setResolutionSelector(
+            ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+                .build()
+        )
         Camera2Interop.Extender(previewBuilder).apply {
             setCaptureRequestOption(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
