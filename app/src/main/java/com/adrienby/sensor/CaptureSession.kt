@@ -25,7 +25,7 @@ class CaptureSession(val dir: File, val id: String) : ImuLogger.Sink {
 
     val meta = JSONObject()
 
-    /** Where the take goes under Download/SensorCapture/ (room/take-type/session). */
+    /** Folder name under Download/SensorCapture/ (one flat folder per take). */
     var exportPath: String = id
 
     private val imu = BufferedWriter(FileWriter(File(dir, "imu.csv")), 1 shl 17)
@@ -196,6 +196,10 @@ class CaptureSession(val dir: File, val id: String) : ImuLogger.Sink {
         meta.put("last_frame_ns", lastFrameNs)
         meta.put("video_start_ns", videoStartNs)
         meta.put("event_count", events.size)
+        // List what the take contains, so the pipeline can check completeness at a glance.
+        val names = (dir.list()?.toMutableList() ?: mutableListOf())
+        if ("meta.json" !in names) names.add("meta.json")
+        meta.put("files", JSONArray(names.sorted()))
         File(dir, "meta.json").writeText(meta.toString(2))
     }
 }

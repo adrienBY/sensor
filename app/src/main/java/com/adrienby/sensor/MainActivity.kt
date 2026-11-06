@@ -472,16 +472,19 @@ class MainActivity : AppCompatActivity() {
             .putBoolean("lockFocus", lockFocus.isChecked)
             .apply()
 
-        // Saved as SensorCapture/<room>/<take type>/<date_time>_<lighting>_<mode>/
-        val stamp = SimpleDateFormat("yyyy-MM-dd_HHmmss", Locale.US).format(Date())
-        val id = "${stamp}_${slug(light)}_${if (arMode) "ar" else "video"}"
-        val folder = "${slug(room)}/${slug(take)}/$id"
+        // One flat folder per take: Download/SensorCapture/<take id>/
+        // The id sorts by time and is also the take's key in the training pipeline.
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val mode = if (arMode) "ar" else "video"
+        val id = "${stamp}_${slug(room)}_${slug(take)}_${slug(light)}_$mode"
+        val folder = id
         val dir = File(getExternalFilesDir(null), "sessions/$id")
         dir.mkdirs()
 
         val s = CaptureSession(dir, id)
         s.exportPath = folder
         s.meta.apply {
+            put("format", "sensor-capture/1")
             put("session", id)
             put("folder", folder)
             put("room", room)

@@ -6,34 +6,40 @@ video, IMU, per-frame camera metadata and timestamped interaction tags, all on o
 Built by GitHub Actions on every push to `main`. The APK is attached to the latest release:
 **https://github.com/adrienBY/sensor/releases/latest/download/sensor-capture.apk**
 
-## What one take produces
+## Dataset format (`sensor-capture/1`)
 
-Takes are sorted by room, then take type:
+Every take is one flat folder directly in `Download/SensorCapture/`. Copy that whole folder to
+the PC as the dataset's raw input (e.g. `data/raw/`); the training pipeline treats each
+sub-folder as one take and never needs anything outside it.
 
 ```
 Download/SensorCapture/
-  corridor/
-    walkthrough/
-      2026-11-07_101530_daylight_ar/
-      2026-11-07_183002_evening-lights-on_ar/
-    transitions/
-  kitchen/
-    interactions/
-      2026-11-07_110415_daylight_video/
-  whole-apartment/
-    walkthrough/
+  20261107-101530_whole-apartment_walkthrough_daylight_ar/
+  20261107-103204_kitchen_interactions_daylight_ar/
+  20261107-183002_corridor_transitions_evening-lights-on_video/
 ```
 
-Session folders are named `<date>_<time>_<lighting>_<mode>`. Each one holds:
+**Take id** = folder name = `meta.json → session`:
+`<yyyyMMdd-HHmmss>_<room>_<take type>_<lighting>_<mode>`, lowercase, no spaces. Names sort by
+time and stay unique, so the id is safe to use as the key for every derived file later
+(`data/processed/<take id>/…`). The name is only for humans; code reads attributes from
+`meta.json`, never by parsing the folder name.
+
+**Rooms**: `corridor`, `living-room`, `kitchen`, `my-room`, `bathroom`, `parents-room`,
+`whole-apartment`, `other`. **Take types**: `walkthrough`, `room-sweep`, `transitions`,
+`interactions`, `free`. **Lighting**: `daylight`, `evening-lights-on`, `night-lights-on`,
+`night-lights-off`, `mixed`. **Mode**: `video` or `ar`.
+
+Inside each take, always the same file names:
 
 | File | Contents |
 | --- | --- |
-| `video.mp4` | 1080p H.264, ~20 Mbps, 30 fps fixed when supported, electronic stabilization off, no audio |
+| `video.mp4` | Camera video, H.264, 30 fps, no audio. Video mode: 1080p, electronic stabilization off. AR mode: written by ARCore at its largest 30 fps stream |
 | `imu.csv` | `timestamp_ns,sensor,x,y,z,w` for `gyro` (rad/s), `accel` (m/s²), `grav` (m/s²), `rot` (game rotation vector quaternion x,y,z,w) at the fastest rate the phone allows |
 | `frames.csv` | One row per camera frame: frame number, sensor timestamp, exposure, ISO, focus distance, focal length and per-frame intrinsics (fx, fy, cx, cy, skew) when the phone reports them |
 | `events.json` | Interaction tags after undo: `{t_ns, t_video_s, object, action}` |
 | `events.log.jsonl` | Raw tag log written as you tap, including undos (crash-safe) |
-| `meta.json` | Room, lighting, take type, mode, device, camera calibration, sensor list, clock anchors, counts |
+| `meta.json` | `format`, room, lighting, take type, mode, device, camera calibration, sensor list, clock anchors, counts, and `files` (the list of files in the take) |
 | `poses.csv` | **AR mode only.** One row per camera frame: `timestamp_ns,tracking,failure_reason,tx,ty,tz,qx,qy,qz,qw` |
 
 ## Two modes
