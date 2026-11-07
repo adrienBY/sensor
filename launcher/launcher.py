@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 2
+LAUNCHER_VERSION = 3
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -127,14 +127,18 @@ def setup_runtime():
            "UV_CACHE_DIR": str(RUNTIME / "cache")}
     steps = [
         ("Installing Python 3.12", [uv, "python", "install", "3.12"]),
-        ("Creating the environment", [uv, "venv", "--seed", "--python", "3.12",
-                                      RUNTIME / "venv"]),
+        ("Creating the environment", None if py.exists() else
+            # --clear: a half-made venv from an interrupted setup is replaced, not an error
+            [uv, "venv", "--seed", "--clear", "--python", "3.12", RUNTIME / "venv"]),
         ("Installing AMD ROCm libraries", [uv, "pip", "install", "--python", py, *ROCM_SDK]),
         ("Installing PyTorch for ROCm", [uv, "pip", "install", "--python", py, *TORCH]),
         ("Installing image and model tools", [uv, "pip", "install", "--python", py, *EXTRA]),
     ]
     for title, cmd in steps:
         say(f"\n> {title}")
+        if cmd is None:
+            say("already there, reusing it")
+            continue
         if run(cmd, env) != 0:
             if cmd[1] == "pip" and py.exists():
                 say("uv failed; retrying with pip")
@@ -374,8 +378,37 @@ def menu(py, s):
             return
 
 
+_LOCK = None
+
+
+def single_instance():
+    """Only one WorldModel window per folder: two at once corrupt the setup and the data."""
+    global _LOCK
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    _LOCK = open(RUNTIME / "running.lock", "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            _LOCK.seek(0)
+            msvcrt.locking(_LOCK.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_LOCK.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
 def main():
     global LOG_FILE
+    if not single_instance():
+        print("WorldModel is already running in another window for this folder.")
+        print("Use that window, or close it first. Press Enter to close this one.")
+        try:
+            input()
+        except EOFError:
+            pass
+        return
     LOGS.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(LOGS / f"{datetime.datetime.now():%Y%m%d-%H%M%S}.log", "w", encoding="utf-8")
     try:
