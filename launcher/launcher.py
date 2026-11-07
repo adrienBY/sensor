@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 7
+LAUNCHER_VERSION = 8
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -354,6 +354,24 @@ def cleanup_old_exe():
             pass
 
 
+def make_dream_shortcuts():
+    """'Dream videos' shortcuts (next to WorldModel.exe and on the Desktop) to the current
+    model's dreams folder, refreshed at every start so they follow settings.json "run"."""
+    if os.name != "nt":
+        return
+    target = RUN / "dreams"
+    target.mkdir(parents=True, exist_ok=True)
+    ps = ("$d = [Environment]::GetFolderPath('Desktop'); "
+          f"foreach ($p in @('{HOME / 'Dream videos.lnk'}', (Join-Path $d 'Dream videos.lnk'))) {{ "
+          "$s = (New-Object -ComObject WScript.Shell).CreateShortcut($p); "
+          f"$s.TargetPath = '{target}'; $s.Save() }}")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
 def open_folder(path):
     try:
         if os.name == "nt":
@@ -390,6 +408,7 @@ def menu(py, s):
         say("  4  Walk in the dream (keyboard)")
         say("  5  Make dream videos")
         say("  6  Open the WorldModel folder")
+        say("  7  Open the dream videos")
         say("  U  Update WorldModel.exe to the latest build (keeps everything)")
         say("  Q  Quit")
         choice = input("> ").strip().lower()
@@ -420,6 +439,9 @@ def menu(py, s):
                     open_folder(RUN / "dreams")
         elif choice == "6":
             open_folder(HOME)
+        elif choice == "7":
+            (RUN / "dreams").mkdir(parents=True, exist_ok=True)
+            open_folder(RUN / "dreams")
         elif choice == "u":
             if update_self():
                 return
@@ -493,6 +515,7 @@ def main():
                 "to use it again).")
         py = setup_runtime()
         install_scripts()
+        make_dream_shortcuts()
         gpu = gpu_name(py)
         if gpu:
             say(f"GPU: {gpu}")
