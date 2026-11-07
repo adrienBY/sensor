@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 import torch
 
+import causal
 import fsr
 import worldmodel as wm
 from dream import decode, load_vae
@@ -109,9 +110,9 @@ def main():
         t = random.choice(data.takes)
         s = random.randint(0, len(t["lat"]) - c - 1)
         state.update(take=t, R=t["R"][s + c - 1].copy(), p=t["p"][s + c - 1].copy())
-        return torch.from_numpy(t["lat"][s:s + c])[None].to(device)
+        state["roll"] = causal.Rollout(model, t, s, device, net)
 
-    ctx = reset()
+    reset()
     if model.mem_k:
         print(f"Memory: {model.mem_k} frames of the current take, picked by where you look.")
     win = "Dream (Q to quit)"
@@ -140,7 +141,7 @@ def main():
         if k.isdigit() and k != "0" and int(k) <= len(vocab):
             event = int(k)
         if k == "r":
-            ctx = reset()
+            reset()
         if k == "q" or key == 27:
             break
         if event:
@@ -154,18 +155,16 @@ def main():
             continue
         run_on -= 1
         has_trans = 1.0 if np.any(trans) else 0.0
-        a = torch.from_numpy(wm.action_vector(rot, trans, has_trans))[None].to(device)
-        e = torch.tensor([event], device=device)
+        a = wm.action_vector(rot, trans, has_trans)
         mem = mem_pose = None
         state["R"], state["p"] = wm.apply_action(state["R"], state["p"], rot, trans * has_trans)
         if model.mem_k:
             mem, mem_pose = wm.memory_for(state["take"], state["R"], state["p"], model.mem_k,
                                           device)
         with wm.autocast(device, args.amp):
-            z = wm.sample_next(net, ctx, a, e, steps=args.steps, mem=mem, mem_pose=mem_pose,
-                               guidance=args.guidance)
-        ctx = torch.cat([ctx[:, 1:], z[:, None].float()], dim=1)
-        img = decode(vae, z, ck["stats"], dtype)[0]
+            z = state["roll"].step(a, event, state["R"], state["p"], steps=args.steps,
+                                   guidance=args.guidance, mem=mem, mem_pose=mem_pose)
+        img = decode(vae, z[None], ck["stats"], dtype)[0]
         h, w = img.shape[:2]
         if args.upscale == "fsr":
             big = fsr.upscale(img, 1280, 720, device=device, sharpness=args.sharpness)

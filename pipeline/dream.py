@@ -59,24 +59,23 @@ def find_revisit_start(take, context, horizon):
 
 
 def rollout(model, take, start, horizon, device, steps=3, amp="fp16", guidance=1.0):
-    lat, act, ev = take["lat"], take["act"], take["ev"]
+    """Dream `horizon` frames after the real frames start .. start+context-1, following the
+    take's real camera motion. Works for v2 and v3 models."""
+    import causal
+    r = causal.Rollout(model, take, start, device)
     c = model.context
-    ctx = torch.from_numpy(lat[start:start + c])[None].to(device)
     exclude = (start - wm.MEM_GAP, start + c + horizon + wm.MEM_GAP)
     dreams = []
     for i in range(horizon):
-        k = start + c - 1 + i
-        a = torch.from_numpy(act[k])[None].to(device)
-        e = torch.tensor([ev[k]], device=device)
+        k = start + c - 1 + i                # step from frame k to the frame being dreamt
         mem = mem_pose = None
-        if model.mem_k:                      # the real camera pose of the frame being dreamt
+        if model.mem_k:                      # memory found from the real pose of that frame
             mem, mem_pose = wm.memory_for(take, take["R"][k + 1], take["p"][k + 1],
                                           model.mem_k, device, exclude)
         with wm.autocast(device, amp):
-            z = wm.sample_next(model, ctx, a, e, steps=steps, mem=mem, mem_pose=mem_pose,
-                               guidance=guidance)
-        dreams.append(z.float())
-        ctx = torch.cat([ctx[:, 1:], z[:, None].to(ctx.dtype)], dim=1)
+            z = r.step(take["act"][k], int(take["ev"][k]), take["R"][k + 1], take["p"][k + 1],
+                       steps=steps, guidance=guidance, mem=mem, mem_pose=mem_pose)
+        dreams.append(z[None].float())
     return torch.cat(dreams)
 
 

@@ -44,6 +44,7 @@ from pathlib import Path
 
 import torch
 
+import causal
 import worldmodel as wm
 
 
@@ -103,6 +104,11 @@ def main():
     ap.add_argument("--dream-every", type=float, default=20, help="minutes between dream videos")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-dreams", action="store_true", help="skip dream videos (testing)")
+    ap.add_argument("--arch", choices=["causal", "memory"], default="causal",
+                    help="new models: causal = v3 (whole-clip, ~174M at size large), memory = v2")
+    ap.add_argument("--size", choices=list(causal.SIZES), default="large", help="v3 model size")
+    ap.add_argument("--clip", type=int, default=causal.CLIP, help="v3 frames per training clip")
+    ap.add_argument("--lr-causal", type=float, default=2e-4, help="v3 learning rate at 8 clips")
     ap.add_argument("--context", type=int, default=wm.NEW_CONTEXT, help="past frames (new models)")
     ap.add_argument("--memory", type=int, default=wm.NEW_MEM_K,
                     help="memory frames per prediction (new models; 0 = no memory)")
@@ -155,6 +161,9 @@ def main():
     if ck:
         model = wm.build_model(ck["config"]).to(device)
         model.load_state_dict(wm.upgrade_state_dict(ck["model"]))
+    elif args.arch == "causal":
+        model = causal.CausalWorldDiT(train.latent_shape, size=args.size, clip=args.clip,
+                                      mem_k=args.memory).to(device)
         if tuple(model.config["latent_shape"]) != tuple(train.latent_shape):
             raise SystemExit("Latent size changed since the last run; start a new run folder.")
     else:
@@ -163,10 +172,20 @@ def main():
         model = wm.WorldDiT(train.latent_shape, dim=args.dim, depth=args.depth,
                             heads=args.dim // 64, context=args.context,
                             mem_k=args.memory).to(device)
+    is_causal = model.config.get("arch") == "causal"
+    if is_causal:
+        model.grad_ckpt = model.config["size"] in ("large", "xl")   # fits 16 GB
+        if args.batch > 32:                   # a v2-sized batch would be 64 whole clips
+            print(f"Batch {args.batch} is meant for the v2 model; using 8 clips.")
+            args.batch = 8
     rollout = 0 if args.no_rollout else wm.ROLLOUT
     t_dev = time.time()
-    train.to_device(device, model.context, rollout, model.mem_k,
-                    weighted=not args.no_weighting, mirror=not args.no_mirror)
+    if is_causal:
+        train.to_device_clips(device, model.clip, model.mem_k, weighted=not args.no_weighting,
+                              mirror=not args.no_mirror)
+    else:
+        train.to_device(device, model.context, rollout, model.mem_k,
+                        weighted=not args.no_weighting, mirror=not args.no_mirror)
     print(f"context {model.context} frames · memory {model.mem_k} frames per prediction · "
           f"self-forcing rollouts {'off' if not rollout else f'from step {args.rollout_start}'}"
           f" · data on GPU in {time.time() - t_dev:.1f} s")
@@ -180,7 +199,8 @@ def main():
         p.requires_grad_(False)
 
     # Larger batches on a big GPU: scale the learning rate with sqrt(batch / 64).
-    lr = args.lr * math.sqrt(args.batch / 64)
+    lr = (args.lr_causal * math.sqrt(args.batch / 8) if is_causal
+          else args.lr * math.sqrt(args.batch / 64))
     opt, opt_kind = make_optimizer(model, lr)
     if ck and ck.get("opt"):
         try:
@@ -198,6 +218,10 @@ def main():
     start_step = step
     minutes_before = ck.get("minutes_trained", 0.0) if ck else 0.0
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    if is_causal:
+        print(f"v3 causal model, size {model.config['size']}: clips of {model.clip} frames, "
+              f"every frame a target, diffusion forcing, QK-norm, 3D RoPE, window {model.window}"
+              f"{', gradient checkpointing' if model.grad_ckpt else ''}")
     print(f"Model: {n_params:.1f}M parameters, optimizer {opt_kind}, lr {lr:.2e}, "
           f"starting at step {step} ({minutes_before:.0f} min trained before)")
 
@@ -267,20 +291,12 @@ def main():
                 print(f"  dream video {path.name}: " +
                       ", ".join(f"{k} {v}" for k, v in m.items() if k.startswith("psnr")))
 
-    budget = args.minutes * 60
-    null_ev = wm.null_event(model)
-    while not stop["now"] and time.time() - t0 < budget:
-        # Learning rate: warm up on a fresh model (1,000 steps) or after resuming (500 steps,
-        # from 10%), hold, then decay to 2% over the last `decay` share of the run.
-        if start_step == 0:
-            f = min(1.0, (step + 1) / 1000)
-        else:
-            f = min(1.0, 0.1 + 0.9 * (step - start_step) / 500)
-        frac = (time.time() - t0) / budget
-        if args.decay > 0 and frac > 1 - args.decay:
-            f *= max(0.02, (1 - frac) / args.decay)
-        for g in opt.param_groups:
-            g["lr"] = lr * f
+    def p_rollout():
+        return 0.0 if not rollout else min(0.5, max(0.0, 0.5 * (step - args.rollout_start)
+                                                     / max(1, args.rollout_full - args.rollout_start)))
+
+    def memory_step():
+        """v2: predict one frame from `context` stacked past frames."""
         b = train.gpu_batch(args.batch)
         C, R = model.context, rollout
         win, acts, evs = b["win"], b["act"], b["ev"]
@@ -294,9 +310,7 @@ def main():
         # Self-forcing: a quarter of the batch replaces its last k context frames with frames
         # the model generates itself (2 quick denoising steps each, no gradient), so it learns
         # to predict the real next frame from its own imperfect output.
-        p_roll = 0.0 if not R else min(0.5, max(0.0, 0.5 * (step - args.rollout_start)
-                                                / max(1, args.rollout_full - args.rollout_start)))
-        if p_roll > 0 and random.random() < p_roll:
+        if random.random() < p_rollout():
             nb, k = max(1, args.batch // 4), random.randint(1, R)
             sub = (lambda x: None if x is None else x[:nb])
             with wm.autocast(device, args.amp):
@@ -308,7 +322,64 @@ def main():
                     c = torch.cat([c[:, 1:], z[:, None].float()], dim=1)
             ctx = torch.cat([c, ctx[nb:]], dim=0)
         with wm.autocast(device, args.amp):
-            loss = wm.training_loss(fwd_model, ctx, tgt, act, ev, mem, mem_pose)
+            return wm.training_loss(fwd_model, ctx, tgt, act, ev, mem, mem_pose)
+
+    mirror_pose = torch.tensor(wm.MIRROR_POSE, device=device, dtype=torch.float32)
+
+    def causal_step():
+        """v3: a batch of whole clips, every frame a target (diffusion forcing)."""
+        b = train.gpu_clip_batch(args.batch)
+        win, act, ev = b["win"], b["act"], b["ev"]
+        mem, mem_pose = b.get("mem"), b.get("mem_pose")
+        if args.action_dropout > 0:                       # per frame: "action unknown"
+            drop = torch.rand(act.shape[:2], device=act.device) < args.action_dropout
+            act = torch.where(drop[..., None], torch.zeros_like(act), act)
+            ev = torch.where(drop, torch.full_like(ev, null_ev), ev)
+        own = own_mask = None
+        if random.random() < p_rollout():
+            # Self-forcing: a quarter of the clips get their last k frames drawn by the model
+            # itself (2 quick steps each, no gradient); those drawings become the inputs and
+            # the real frames stay the targets, so it learns to correct its own output.
+            T, W = model.clip, model.window
+            nb, k = max(1, args.batch // 4), random.randint(1, wm.ROLLOUT)
+            own = win.clone()
+            flip = b.get("flip")
+            with torch.no_grad(), wm.autocast(device, args.amp):
+                for j in range(k):
+                    pos = T - k + j
+                    lo = max(0, pos - (W - 1))
+                    pw = causal.relative_pose_t(b["R"][:nb, pos:pos + 1], b["p"][:nb, pos:pos + 1],
+                                                b["R"][:nb, lo:pos + 1], b["p"][:nb, lo:pos + 1],
+                                                b["has"][:nb, lo:pos + 1])
+                    if flip is not None:
+                        pw = torch.where(flip[:nb, None, None], pw * mirror_pose, pw)
+                    z = causal.sample_next(model, own[:nb, lo:pos], act[:nb, lo:pos + 1],
+                                           ev[:nb, lo:pos + 1], pw,
+                                           None if mem is None else mem[:nb],
+                                           None if mem_pose is None else mem_pose[:nb], steps=2)
+                    own[:nb, pos] = z.float()
+            own_mask = torch.zeros(win.shape[:2], dtype=torch.bool, device=device)
+            own_mask[:nb, T - k:] = True
+        with wm.autocast(device, args.amp):
+            return causal.training_loss(fwd_model, win, act, ev, b["pose"], mem, mem_pose,
+                                        own, own_mask)
+
+    budget = args.minutes * 60
+    null_ev = wm.null_event(model)
+    frames_per_sample = model.clip if is_causal else 1     # target frames per batch element
+    while not stop["now"] and time.time() - t0 < budget:
+        # Learning rate: warm up on a fresh model (1,000 steps) or after resuming (500 steps,
+        # from 10%), hold, then decay to 2% over the last `decay` share of the run.
+        if start_step == 0:
+            f = min(1.0, (step + 1) / 1000)
+        else:
+            f = min(1.0, 0.1 + 0.9 * (step - start_step) / 500)
+        frac = (time.time() - t0) / budget
+        if args.decay > 0 and frac > 1 - args.decay:
+            f *= max(0.02, (1 - frac) / args.decay)
+        for g in opt.param_groups:
+            g["lr"] = lr * f
+        loss = causal_step() if is_causal else memory_step()
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
@@ -332,7 +403,7 @@ def main():
             now = time.time()
             print(f"step {step:7d}  loss {loss_avg:.4f}  "
                   f"{log_n / (now - log_t):6.1f} steps/s  "
-                  f"{log_n * args.batch / (now - log_t):7.0f} samples/s  "
+                  f"{log_n * args.batch * frames_per_sample / (now - log_t):7.0f} frames/s  "
                   f"{(args.minutes * 60 - (now - t0)) / 60:5.1f} min left"
                   + (f"  ({bad} steps skipped: loss not finite)" if bad else ""), flush=True)
             log_loss.zero_()

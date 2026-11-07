@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 8
+LAUNCHER_VERSION = 9
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -36,9 +36,9 @@ ROCM_SDK = [
 TORCH = [ROCM + "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"]
 EXTRA = ["numpy", "opencv-python", "diffusers", "safetensors", "accelerate"]
 DEFAULT_SETTINGS = {"train_minutes": 60, "fps": 15, "width": 256, "height": 144,
-                    "amp": "fp16", "batch": 64, "tunableop": False, "dream_steps": 3,
-                    "run": "memory", "action_guidance": 1.0}
-MODEL_VERSION = "memory-1"   # the benchmark re-runs once when the model architecture changes
+                    "amp": "fp16", "batch": 8, "tunableop": False, "dream_steps": 3,
+                    "run": "v3", "action_guidance": 1.0, "arch": "causal", "model_size": "large"}
+MODEL_VERSION = "v3"       # + arch and size: the benchmark re-runs when the model changes
 
 FROZEN = getattr(sys, "frozen", False)
 BUNDLE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -216,7 +216,13 @@ def settings():
     s = dict(DEFAULT_SETTINGS)
     if path.exists():
         try:
-            s.update(json.loads(path.read_text()))
+            saved = json.loads(path.read_text())
+            if "arch" not in saved:            # settings from before v3: move to the v3 model
+                for k in ("run", "batch", "arch", "model_size"):
+                    saved.pop(k, None)
+                saved.pop("tuned_model", None)
+                path.write_text(json.dumps({**s, **saved}, indent=2))
+            s.update(saved)
         except ValueError:
             say("settings.json is not valid JSON; using defaults")
     else:
@@ -279,13 +285,15 @@ def tune(py, s):
     """Benchmark once per GPU: the fastest precision, batch size and TunableOp on this card.
     Delete "tuned_gpu" from settings.json to measure again."""
     gpu = gpu_name(py)
-    if not gpu or (s.get("tuned_gpu") == gpu and s.get("tuned_model") == MODEL_VERSION):
+    version = f"{MODEL_VERSION}-{s['arch']}-{s['model_size']}"
+    if not gpu or (s.get("tuned_gpu") == gpu and s.get("tuned_model") == version):
         return s
     out = RUNTIME / "bench.json"
     if out.exists():
         out.unlink()
     ok = step(py, f"Measuring the fastest training settings on your {gpu} (a few minutes, once)",
-              "bench.py", "--out", out, "--cache-dir", RUNTIME)
+              "bench.py", "--out", out, "--cache-dir", RUNTIME, "--arch", s["arch"],
+              "--size", s["model_size"])
     if ok and out.exists():
         b = json.loads(out.read_text())
         s.update({"amp": b["amp"], "batch": b["batch"], "tunableop": b["tunableop"],
@@ -293,10 +301,12 @@ def tune(py, s):
         say(f"Saved to settings.json: {b['amp']}, batch {b['batch']}, "
             f"TunableOp {'on' if b['tunableop'] else 'off'}")
     else:
+        if s.get("arch") == "causal":
+            s["batch"] = 8
         say(f"Using safe defaults ({s['amp']}, batch {s['batch']}, TunableOp off). To measure "
             'again, delete the "tuned_gpu" line from settings.json.')
         s["tunableop"] = False
-    s["tuned_gpu"], s["tuned_model"] = gpu, MODEL_VERSION
+    s["tuned_gpu"], s["tuned_model"] = gpu, version
     save_settings(s)
     return s
 
@@ -306,7 +316,8 @@ def train(py, s, minutes=None):
     s = tune(py, s)
     ok = step(py, f"Training the world model for {minutes} minutes (Ctrl+C stops and saves)",
               "train.py", PROCESSED, RUN, "--minutes", minutes, "--amp", s["amp"],
-              "--batch", s["batch"], "--dream-steps", s["dream_steps"], env=env_for(s))
+              "--batch", s["batch"], "--dream-steps", s["dream_steps"], "--arch", s["arch"],
+              "--size", s["model_size"], env=env_for(s))
     if ok and (RUN / "dreams").exists():
         say(f"\nDream videos: {RUN / 'dreams'}")
         open_folder(RUN / "dreams")
@@ -508,12 +519,11 @@ def main():
     try:
         say(f"World Model launcher v{LAUNCHER_VERSION}  ·  folder: {HOME}")
         s = settings()
-        RUN = HOME / "runs" / str(s.get("run") or "memory")
-        if s["run"] == "memory" and (HOME / "runs" / "main" / "last.pt").exists() \
-                and not (RUN / "last.pt").exists():
-            say("New model version with memory: it trains from scratch in runs\\memory.")
-            say('Your previous model stays in runs\\main (set "run": "main" in settings.json '
-                "to use it again).")
+        RUN = HOME / "runs" / str(s.get("run") or "v3")
+        if not (RUN / "last.pt").exists() and any((HOME / "runs").glob("*/last.pt")):
+            say(f"New model ({s['arch']}, size {s['model_size']}): it trains from scratch in "
+                f"runs\\{RUN.name}. Earlier models stay in their folders; set \"run\" in "
+                "settings.json (e.g. \"memory\") to use one again.")
         py = setup_runtime()
         install_scripts()
         make_dream_shortcuts()

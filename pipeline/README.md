@@ -147,3 +147,13 @@ python sensor\pipeline\train.py data\processed runs\main --minutes 60 --amp fp16
 
 (Use the `amp` and `batch` that `bench.json` reports, and drop the three `$env:` settings if it
 says TunableOp did not help.)
+
+## Model v3 (default for new runs)
+
+`causal.py`: a frame-causal diffusion transformer trained on whole 16-frame clips, where every
+frame is a target and can only see the past. Each frame has its own noise level (diffusion
+forcing). It uses RMSNorm and QK-norm for stable FP16, 3D rotary positions, a per-frame camera
+pose relative to the newest frame, memory frames as prefix tokens, action dropout for action
+guidance, and gradient checkpointing. Sizes (`"model_size"` in `settings.json`): base 58M,
+large 174M (default), xl 384M. When dreaming it re-runs the last 12 frames each step. New runs
+go to `runs\v3`; earlier models stay in their folders (`"run": "memory"` uses the v2 model).

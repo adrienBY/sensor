@@ -33,7 +33,7 @@ def tunable_env(enabled, cache_dir):
             "PYTORCH_TUNABLEOP_FILENAME": str(Path(cache_dir) / TUNABLE_FILE)}
 
 
-def worker(amp, batch, seconds, warmup):
+def worker(amp, batch, seconds, warmup, arch="causal", size="large"):
     import torch
     import worldmodel as wm
     from train import make_optimizer
@@ -48,7 +48,14 @@ def worker(amp, batch, seconds, warmup):
 
     try:
         torch.manual_seed(0)
-        model = wm.WorldDiT(LATENT, context=wm.NEW_CONTEXT, mem_k=wm.NEW_MEM_K).to(dev)
+        if arch == "causal":
+            import causal
+            model = causal.CausalWorldDiT(LATENT, size=size).to(dev)
+            model.grad_ckpt = size in ("large", "xl")
+            T = model.clip
+        else:
+            model = wm.WorldDiT(LATENT, context=wm.NEW_CONTEXT, mem_k=wm.NEW_MEM_K).to(dev)
+            T = 1
         opt, opt_kind = make_optimizer(model, 1e-4)
         scaler = torch.amp.GradScaler(dev.type, enabled=(amp == "fp16" and dev.type == "cuda"))
         ctx = torch.randn(batch, wm.NEW_CONTEXT, *LATENT, device=dev)
@@ -60,9 +67,18 @@ def worker(amp, batch, seconds, warmup):
         ev = torch.zeros(batch, dtype=torch.long, device=dev)
         params = list(model.parameters())
 
+        if arch == "causal":
+            clip = torch.randn(batch, T, *LATENT, device=dev)
+            cact = torch.randn(batch, T, wm.ACTION_DIM, device=dev)
+            cev = torch.zeros(batch, T, dtype=torch.long, device=dev)
+            cpose = torch.rand(batch, T, wm.POSE_DIM, device=dev)
+
         def one_step():
             with wm.autocast(dev, amp):
-                loss = wm.training_loss(model, ctx, tgt, act, ev, mem, mem_pose)
+                if arch == "causal":
+                    loss = causal.training_loss(model, clip, cact, cev, cpose, mem, mem_pose)
+                else:
+                    loss = wm.training_loss(model, ctx, tgt, act, ev, mem, mem_pose)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -89,17 +105,21 @@ def worker(amp, batch, seconds, warmup):
             except Exception:
                 pass
         mem = torch.cuda.max_memory_allocated() / 2**30 if dev.type == "cuda" else 0.0
-        return {"ok": True, "samples_per_s": n * batch / dt, "steps_per_s": n / dt,
+        return {"ok": True, "samples_per_s": n * batch * T / dt, "steps_per_s": n / dt,
                 "peak_gb": round(mem, 2), "optimizer": opt_kind, **info}
     except RuntimeError as e:   # out of memory or an unsupported kernel
         return {"ok": False, "error": str(e).splitlines()[0][:200], **info}
+
+
+ARGS = None
 
 
 def run_config(amp, batch, seconds, tunable, cache_dir):
     env = dict(os.environ)
     env.update(tunable_env(tunable, cache_dir))
     cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", "--amp", amp,
-           "--batch", str(batch), "--seconds", str(seconds), "--warmup", "5"]
+           "--batch", str(batch), "--seconds", str(seconds), "--warmup", "5",
+           "--arch", ARGS.arch, "--size", ARGS.size]
     try:
         out = subprocess.run(cmd, capture_output=True, text=True, env=env,
                              cwd=str(Path(__file__).resolve().parent),
@@ -116,7 +136,7 @@ def run_config(amp, batch, seconds, tunable, cache_dir):
 def describe(r):
     if not r["ok"]:
         return f"failed ({r['error']})"
-    return f"{r['samples_per_s']:8.0f} samples/s, {r['peak_gb']} GB"
+    return f"{r['samples_per_s']:8.0f} frames/s, {r['peak_gb']} GB"
 
 
 def main():
@@ -124,16 +144,25 @@ def main():
     ap.add_argument("--seconds", type=float, default=10, help="measured seconds per setting")
     ap.add_argument("--out", type=Path, default=Path("bench.json"))
     ap.add_argument("--cache-dir", type=Path, default=Path("."))
-    ap.add_argument("--batches", default="64,128,256")
+    ap.add_argument("--batches", default=None,
+                    help="default 64,128,256 (memory) or 4,8 clips (causal)")
+    ap.add_argument("--arch", choices=["causal", "memory"], default="causal")
+    ap.add_argument("--size", default="large")
     ap.add_argument("--amps", default="fp16,bf16")
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--amp", default="fp16", help=argparse.SUPPRESS)
     ap.add_argument("--batch", type=int, default=64, help=argparse.SUPPRESS)
     ap.add_argument("--warmup", type=float, default=5, help=argparse.SUPPRESS)
     args = ap.parse_args()
+    global ARGS
+    ARGS = args
+    if args.batches is None:
+        # v3: whole clips per step; 16 large clips can overflow 16 GB into slow shared memory
+        args.batches = "4,8" if args.arch == "causal" else "64,128,256"
 
     if args.worker:
-        print(json.dumps(worker(args.amp, args.batch, args.seconds, args.warmup)), flush=True)
+        print(json.dumps(worker(args.amp, args.batch, args.seconds, args.warmup, args.arch,
+                                args.size)), flush=True)
         return
 
     amps = args.amps.split(",")
@@ -184,7 +213,7 @@ def main():
               "samples_per_s": round(best["samples_per_s"]), "gpu": gpu, "results": results}
     args.out.write_text(json.dumps(choice, indent=2))
     print(f"Best: {choice['amp']}, batch {choice['batch']}, TunableOp "
-          f"{'on' if choice['tunableop'] else 'off'}: {choice['samples_per_s']} samples/s")
+          f"{'on' if choice['tunableop'] else 'off'}: {choice['samples_per_s']} frames/s")
 
 
 if __name__ == "__main__":

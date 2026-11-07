@@ -68,7 +68,7 @@ jobs:
           .\uv.exe --version
 
       - name: Check the pipeline scripts compile
-        run: python -m py_compile launcher/launcher.py pipeline/preprocess.py pipeline/encode_latents.py pipeline/worldmodel.py pipeline/train.py pipeline/dream.py pipeline/play.py pipeline/bench.py pipeline/fsr.py tools/check_session.py
+        run: python -m py_compile launcher/launcher.py pipeline/preprocess.py pipeline/encode_latents.py pipeline/worldmodel.py pipeline/train.py pipeline/dream.py pipeline/play.py pipeline/bench.py pipeline/fsr.py pipeline/causal.py tools/check_session.py
 
       - name: Build WorldModel.exe
         shell: pwsh

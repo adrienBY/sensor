@@ -293,6 +293,92 @@ class Dataset:
             self.g_mem_pose = torch.from_numpy(np.concatenate(mem_pose)).to(device)
         return self
 
+    def to_device_clips(self, device, clip, mem_k=0, candidates=MEM_CANDIDATES, weighted=True,
+                        mirror=False):
+        """v3 (causal) training data: whole clips of `clip` frames, with per-frame camera
+        poses and memory candidates, all on the GPU."""
+        self.clip, self.mem_k, self.mirror = clip, mem_k, mirror
+        lat, act, ev, starts, weights, rs, ps, hs, mem_idx, mem_pose = ([] for _ in range(10))
+        offset = 0
+        for t in self.takes:
+            n = len(t["lat"])
+            lat.append(t["lat"].astype(np.float16))
+            a = np.zeros((n, ACTION_DIM), np.float32)
+            a[:n - 1] = t["act"]                       # g_act[i] = step from frame i to i+1
+            act.append(a)
+            e = np.zeros(n, np.int64)
+            e[:n - 1] = t["ev"]
+            ev.append(e)
+            rs.append(t["R"].astype(np.float32))
+            ps.append(t["p"].astype(np.float32))
+            hs.append(np.full(n, t["has"]))
+            if n - clip > 1:                           # clips start at frame 1 (action into it)
+                local = np.arange(1, n - clip + 1)
+                starts.append(local + offset)
+                w = np.ones(len(local))
+                if weighted:
+                    steps = local[:, None] + np.arange(clip)[None] - 1
+                    w[(t["ev"][steps] > 0).any(1)] *= W_EVENT
+                    w[(t["turn"][steps] > FAST_TURN).any(1)] *= W_FAST_TURN
+                    if t["sharp"] is not None:
+                        fr = local[:, None] + np.arange(clip)[None]
+                        blurry = (t["sharp"][fr] < BLURRY * np.median(t["sharp"])).mean(1)
+                        w[blurry > 0.5] *= W_BLURRY
+                weights.append(w)
+            if mem_k:
+                idx, pose = memory_table(t["R"], t["p"], candidates, MEM_GAP, float(t["has"]))
+                mem_idx.append(np.where(idx >= 0, idx + offset, -1))
+                mem_pose.append(pose)
+            offset += n
+        if not starts:
+            raise SystemExit("The takes are too short for this model's clip length.")
+        cat = lambda x: torch.from_numpy(np.concatenate(x)).to(device)
+        self.g_lat, self.g_act, self.g_ev = cat(lat), cat(act), cat(ev)
+        self.g_R, self.g_p, self.g_has = cat(rs), cat(ps), cat(hs)
+        self.g_starts = cat(starts)
+        w = np.concatenate(weights)
+        self.g_weights = torch.from_numpy(w / w.sum()).float().to(device)
+        self.weight_stats = {"boosted_share": float(w[w > 1].sum() / w.sum())}
+        self.g_clip = torch.arange(clip, device=device)
+        if mem_k:
+            self.g_mem_idx, self.g_mem_pose = cat(mem_idx), cat(mem_pose)
+        return self
+
+    def gpu_clip_batch(self, n):
+        """n clips: win [n, T, C, H, W], act / ev into each frame, R / p / has per frame,
+        pose [n, T, POSE_DIM] relative to the clip's last frame, and memory for that frame."""
+        import causal
+        dev = self.g_starts.device
+        s = self.g_starts[torch.multinomial(self.g_weights, n, replacement=True)]
+        idx = s[:, None] + self.g_clip
+        out = {"win": self.g_lat[idx].float(), "act": self.g_act[idx - 1], "ev": self.g_ev[idx - 1],
+               "R": self.g_R[idx], "p": self.g_p[idx], "has": self.g_has[idx]}
+        last = idx[:, -1]
+        out["pose"] = causal.relative_pose_t(out["R"][:, -1:], out["p"][:, -1:], out["R"], out["p"],
+                                             out["has"])
+        if self.mem_k:
+            cand, pose = self.g_mem_idx[last], self.g_mem_pose[last]
+            pick = (torch.rand(cand.shape, device=dev) + (cand >= 0)).topk(self.mem_k, 1).indices
+            ci = cand.gather(1, pick)
+            cp = pose.gather(1, pick[..., None].expand(-1, -1, POSE_DIM))
+            valid = (ci >= 0) & (torch.rand(n, 1, device=dev) >= MEM_DROPOUT)
+            out["mem"] = self.g_lat[ci.clamp(min=0)].float() * valid[..., None, None, None]
+            out["mem_pose"] = cp * valid[..., None]
+        if self.mirror:
+            flip = torch.rand(n, device=dev) < 0.5
+            f5 = flip[:, None, None, None, None]
+            out["win"] = torch.where(f5, out["win"].flip(-1), out["win"])
+            sa = torch.tensor(MIRROR_ACT, device=dev, dtype=torch.float32)
+            sp = torch.tensor(MIRROR_POSE, device=dev, dtype=torch.float32)
+            out["act"] = torch.where(flip[:, None, None], out["act"] * sa, out["act"])
+            out["pose"] = torch.where(flip[:, None, None], out["pose"] * sp, out["pose"])
+            out["flip"] = flip
+            if self.mem_k:
+                out["mem"] = torch.where(f5, out["mem"].flip(-1), out["mem"])
+                out["mem_pose"] = torch.where(flip[:, None, None], out["mem_pose"] * sp,
+                                              out["mem_pose"])
+        return out
+
     def gpu_batch(self, n):
         """Random training windows, built entirely on the device. Returns a dict:
         win [n, R+C+1, ...] latents (the last one is the target), act / ev for each step of
@@ -607,6 +693,9 @@ def upgrade_state_dict(sd):
 
 def build_model(config):
     cfg = dict(config)
+    if cfg.get("arch") == "causal":
+        import causal
+        return causal.CausalWorldDiT(tuple(cfg.pop("latent_shape")), **cfg)
     return WorldDiT(tuple(cfg.pop("latent_shape")), **cfg)
 
 
