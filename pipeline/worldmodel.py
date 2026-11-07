@@ -161,22 +161,53 @@ def memory_table(r, p, m, gap, has_pos):
 
 
 def memory_for(take, rq, pq, k, device, exclude=None):
-    """Memory for one query view from a take's frames: tensors [1, k, C, H, W] and
-    [1, k, POSE_DIM]; empty slots are zeros with valid = 0. `exclude` = (first, last) frames
-    not to use (dream videos exclude the clip they are predicting)."""
-    lat = take["lat"]
-    s = view_scores(np.asarray(rq)[None], np.asarray(pq)[None], take["R"], take["p"])[0]
+    """Memory for one query view: tensors [1, k, C, H, W] and [1, k, POSE_DIM]; empty slots
+    are zeros with valid = 0. Searches every take sharing this take's map (just the take itself
+    when it is not aligned). `exclude` = (first, last) frames of this take not to use (dream
+    videos exclude the clip they are predicting)."""
+    bank = take["bank"]
+    lat0 = take["lat"]
+    s = view_scores(np.asarray(rq)[None], np.asarray(pq)[None], bank["R"], bank["p"])[0]
     if exclude is not None:
-        s[max(0, exclude[0]):max(0, exclude[1])] = -np.inf
-    mem = np.zeros((k,) + lat.shape[1:], np.float32)
+        o = take["bank_off"]
+        s[o + max(0, exclude[0]):o + min(len(lat0), max(0, exclude[1]))] = -np.inf
+    mem = np.zeros((k,) + lat0.shape[1:], np.float32)
     pose = np.zeros((k, POSE_DIM), np.float32)
     for slot, j in enumerate(np.argsort(-s)[:k]):
         if not np.isfinite(s[j]):
             break
-        mem[slot] = lat[j]
-        pose[slot] = relative_pose(np.asarray(rq), np.asarray(pq), take["R"][j], take["p"][j],
-                                   float(take["has"]))
+        src = bank["takes"][bank["take"][j]]
+        mem[slot] = src["lat"][bank["frame"][j]]
+        pose[slot] = relative_pose(np.asarray(rq), np.asarray(pq), bank["R"][j], bank["p"][j],
+                                   float(take["has"]) * float(bank["has"][j]))
     return torch.from_numpy(mem)[None].to(device), torch.from_numpy(pose)[None].to(device)
+
+
+def bank_memory_table(bank, m, gap):
+    """Best m memory frames for every frame of a bank (one shared map): indices into the bank
+    (-1 = none) and relative poses. Frames of the same take within `gap` frames are excluded;
+    other takes of the map are always allowed."""
+    r, p, tk, fr, has = bank["R"], bank["p"], bank["take"], bank["frame"], bank["has"]
+    n = len(r)
+    idx = np.full((n, m), -1, np.int64)
+    pose = np.zeros((n, m, POSE_DIM), np.float32)
+    k = min(m, n)
+    for a in range(0, n, 1024):
+        b = min(n, a + 1024)
+        sc = view_scores(r[a:b], p[a:b], r, p)
+        near = (tk[a:b, None] == tk[None]) & (np.abs(fr[a:b, None] - fr[None]) <= gap)
+        sc[near] = -np.inf
+        top = np.argpartition(-sc, k - 1, axis=1)[:, :k]
+        top_s = np.take_along_axis(sc, top, 1)
+        order = np.argsort(-top_s, axis=1)
+        top, top_s = np.take_along_axis(top, order, 1), np.take_along_axis(top_s, order, 1)
+        ok = np.isfinite(top_s)
+        idx[a:b, :k] = np.where(ok, top, -1)
+        q = np.arange(a, b)[:, None].repeat(k, 1)
+        rp = relative_pose(r[q], p[q], r[top], p[top], has[q] * has[top])
+        rp[~ok] = 0
+        pose[a:b, :k] = rp
+    return idx, pose
 
 
 # ---------------------------------------------------------------------------------------
@@ -208,8 +239,13 @@ def clean_actions(rot, trans, has_trans):
 class Dataset:
     """All encoded takes of one split, held in RAM (an hour of footage is ~250 MB)."""
 
-    def __init__(self, processed: Path, split=None, stats=None):
+    def __init__(self, processed: Path, split=None, stats=None, use_map=True):
         index = json.loads((processed / "index.json").read_text())
+        aligned = {}                         # take -> (R, p, map name) from align_takes.py
+        if use_map and (processed / "map.json").exists():
+            for room, entry in json.loads((processed / "map.json").read_text())["rooms"].items():
+                for name, tr in entry["takes"].items():
+                    aligned[name] = (np.array(tr["R"]), np.array(tr["p"]), room)
         self.vocab = index.get("event_vocab", [])
         self.takes = []
         for e in index["takes"]:
@@ -224,6 +260,10 @@ class Dataset:
             a = np.load(d / "actions.npz")
             rot, trans, has = clean_actions(a["rot"], a["trans"], a["has_trans"])
             r, p = integrate_poses(rot, trans * has[:, None])
+            group = e["take"]
+            if e["take"] in aligned:          # move the camera path into the shared map
+                ra, pa, group = aligned[e["take"]]
+                r, p = ra @ r, p @ ra.T + pa
             sharp = None
             if (d / "sharpness.npy").exists():
                 sharp = np.load(d / "sharpness.npy").astype(np.float32)
@@ -238,6 +278,7 @@ class Dataset:
                 "R": r, "p": p, "has": bool(has.any()),
                 "turn": np.linalg.norm(rot, axis=1), "sharp": sharp,
                 "room": scene_id(e.get("room"), ROOMS), "light": scene_id(e.get("lighting"), LIGHTS),
+                "group": group,
             })
         if not self.takes:
             return
@@ -251,6 +292,42 @@ class Dataset:
         for t in self.takes:
             t["lat"] = (t["lat"] - m) / s
         self.latent_shape = self.takes[0]["lat"].shape[1:]
+        # Memory banks: all frames of the takes sharing a map (poses only; latents stay in
+        # their takes). An unaligned take is a bank of its own.
+        self.banks = {}
+        for i, t in enumerate(self.takes):
+            self.banks.setdefault(t["group"], []).append(i)
+        for g, members in self.banks.items():
+            takes = [self.takes[i] for i in members]
+            bank = {"takes": takes,
+                    "R": np.concatenate([t["R"] for t in takes]),
+                    "p": np.concatenate([t["p"] for t in takes]),
+                    "has": np.concatenate([np.full(len(t["lat"]), float(t["has"])) for t in takes]),
+                    "take": np.concatenate([np.full(len(t["lat"]), j) for j, t in enumerate(takes)]),
+                    "frame": np.concatenate([np.arange(len(t["lat"])) for t in takes])}
+            off = 0
+            for t in takes:
+                t["bank"], t["bank_off"] = bank, off
+                off += len(t["lat"])
+            self.banks[g] = bank
+        self.shared = sum(len(b["takes"]) for b in self.banks.values() if len(b["takes"]) > 1)
+
+    def memory_tables(self, candidates, gap=MEM_GAP):
+        """Per take, in take order: memory candidate indices into the concatenated GPU arrays
+        (takes in self.takes order) and their relative poses."""
+        start, off = {}, 0
+        for t in self.takes:
+            start[id(t)] = off
+            off += len(t["lat"])
+        out = {}
+        for bank in self.banks.values():
+            idx, pose = bank_memory_table(bank, candidates, gap)
+            glob = np.array([start[id(t)] for t in bank["takes"]])[bank["take"]] + bank["frame"]
+            gidx = np.where(idx >= 0, glob[np.maximum(idx, 0)], -1)
+            for t in bank["takes"]:
+                o = t["bank_off"]
+                out[id(t)] = (gidx[o:o + len(t["lat"])], pose[o:o + len(t["lat"])])
+        return [out[id(t)] for t in self.takes]
 
     def __len__(self):
         return len(self.takes)
@@ -266,8 +343,9 @@ class Dataset:
         frame are precomputed."""
         self.context, self.rollout, self.mem_k, self.mirror = context, rollout, mem_k, mirror
         lat, act, ev, starts, mem_idx, mem_pose, weights = [], [], [], [], [], [], []
+        tables = self.memory_tables(candidates) if mem_k else None
         offset = 0
-        for t in self.takes:
+        for ti, t in enumerate(self.takes):
             n = len(t["lat"])
             lat.append(t["lat"].astype(np.float16))
             a = np.zeros((n, ACTION_DIM), np.float32)
@@ -288,8 +366,8 @@ class Dataset:
                         w[t["sharp"][frame_i] < BLURRY * np.median(t["sharp"])] *= W_BLURRY
                 weights.append(w)
             if mem_k:
-                idx, pose = memory_table(t["R"], t["p"], candidates, MEM_GAP, float(t["has"]))
-                mem_idx.append(np.where(idx >= 0, idx + offset, -1))
+                idx, pose = tables[ti]
+                mem_idx.append(idx)
                 mem_pose.append(pose)
             offset += n
         if not starts:
@@ -316,8 +394,9 @@ class Dataset:
         self.clip, self.mem_k, self.mirror = clip, mem_k, mirror
         lat, act, ev, starts, weights, rs, ps, hs, mem_idx, mem_pose = ([] for _ in range(10))
         first, last, room, light = [], [], [], []
+        tables = self.memory_tables(candidates) if mem_k else None
         offset = 0
-        for t in self.takes:
+        for ti, t in enumerate(self.takes):
             n = len(t["lat"])
             lat.append(t["lat"].astype(np.float16))
             a = np.zeros((n, ACTION_DIM), np.float32)
@@ -347,8 +426,8 @@ class Dataset:
                         w[blurry > 0.5] *= W_BLURRY
                 weights.append(w)
             if mem_k:
-                idx, pose = memory_table(t["R"], t["p"], candidates, MEM_GAP, float(t["has"]))
-                mem_idx.append(np.where(idx >= 0, idx + offset, -1))
+                idx, pose = tables[ti]
+                mem_idx.append(idx)
                 mem_pose.append(pose)
             offset += n
         if not starts:

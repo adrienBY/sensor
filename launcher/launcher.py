@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 10
+LAUNCHER_VERSION = 11
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -279,7 +279,11 @@ def process(py, s):
                 RAW, PROCESSED, "--width", s["width"], "--height", s["height"], "--fps", s["fps"]):
         return False
     drop = ["--drop-frames"] if s["width"] > 256 else []
-    return step(py, "3/3  Encoding frames into latents (GPU)", "encode_latents.py", PROCESSED, *drop)
+    if not step(py, "3/3  Encoding frames into latents (GPU)", "encode_latents.py", PROCESSED, *drop):
+        return False
+    # shared room maps, so memory can use every take of a room (informational: never blocks)
+    step(py, "Map: aligning takes of the same room", "align_takes.py", PROCESSED)
+    return True
 
 
 def tune(py, s):
