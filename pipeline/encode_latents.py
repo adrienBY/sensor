@@ -29,7 +29,7 @@ MODEL_ID = os.environ.get("WORLDMODEL_TAESD", "madebyollin/taesd")
 
 
 @torch.no_grad()
-def encode_take(vae, take: Path, device, dtype, batch: int, force: bool):
+def encode_take(vae, take: Path, device, dtype, batch: int, force: bool, drop_frames=False):
     out = take / "latents.npy"
     if out.exists() and not force:
         print("  latents already there (use --force to redo)")
@@ -69,6 +69,13 @@ def encode_take(vae, take: Path, device, dtype, batch: int, force: bool):
     info["latents"] = stats
     info_path.write_text(json.dumps(info, indent=2))
     print(f"  {t} frames -> latents {list(latents.shape)}, std {stats['latent_std']:.2f}")
+    if drop_frames:                    # the model only needs latents; 512x288 frames are big
+        del frames
+        try:
+            (take / "frames.npy").unlink()
+            print("  frames.npy removed (latents and preview.png kept)")
+        except OSError:
+            pass
 
 
 def main():
@@ -77,6 +84,8 @@ def main():
     ap.add_argument("--batch", type=int, default=64)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--drop-frames", action="store_true",
+                    help="delete frames.npy after encoding (saves disk at 512x288)")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -90,7 +99,7 @@ def main():
         raise SystemExit(f"No processed takes in {args.processed}; run preprocess.py first")
     for take in takes:
         print(f"== {take.name}")
-        encode_take(vae, take, device, dtype, args.batch, args.force)
+        encode_take(vae, take, device, dtype, args.batch, args.force, args.drop_frames)
     print("\nDone. Open a few preview.png files: the bottom row should look like the top row.")
 
 

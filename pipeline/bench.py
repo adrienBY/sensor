@@ -48,18 +48,28 @@ def worker(amp, batch, seconds, warmup, arch="causal", size="large"):
 
     try:
         torch.manual_seed(0)
-        if arch == "causal":
+        if arch == "world":                   # the permanent model at 512x288 (36x64 latents)
             import causal
+            LAT = (4, 36, 64)
+            model = causal.CausalWorldDiT(LAT, size=size, arch="world", objective="flow", patch=4,
+                                          mem_patch=(6, 8), n_events=256, n_rooms=wm.N_ROOMS,
+                                          n_lights=wm.N_LIGHTS, max_stride=4).to(dev)
+            model.grad_ckpt = size in ("large", "xl")
+            T = model.clip
+        elif arch == "causal":
+            import causal
+            LAT = LATENT
             model = causal.CausalWorldDiT(LATENT, size=size).to(dev)
             model.grad_ckpt = size in ("large", "xl")
             T = model.clip
         else:
+            LAT = LATENT
             model = wm.WorldDiT(LATENT, context=wm.NEW_CONTEXT, mem_k=wm.NEW_MEM_K).to(dev)
             T = 1
-        opt, opt_kind = make_optimizer(model, 1e-4)
+        opt, opt_kind = make_optimizer(model, 1e-4, muon=(arch == "world"))
         scaler = torch.amp.GradScaler(dev.type, enabled=(amp == "fp16" and dev.type == "cuda"))
         ctx = torch.randn(batch, wm.NEW_CONTEXT, *LATENT, device=dev)
-        mem = torch.randn(batch, wm.NEW_MEM_K, *LATENT, device=dev)
+        mem = torch.randn(batch, wm.NEW_MEM_K, *LAT, device=dev)
         mem_pose = torch.rand(batch, wm.NEW_MEM_K, wm.POSE_DIM, device=dev)
         mem_pose[..., -1] = 1.0
         tgt = torch.randn(batch, *LATENT, device=dev)
@@ -67,15 +77,15 @@ def worker(amp, batch, seconds, warmup, arch="causal", size="large"):
         ev = torch.zeros(batch, dtype=torch.long, device=dev)
         params = list(model.parameters())
 
-        if arch == "causal":
-            clip = torch.randn(batch, T, *LATENT, device=dev)
+        if arch in ("causal", "world"):
+            clip = torch.randn(batch, T, *LAT, device=dev)
             cact = torch.randn(batch, T, wm.ACTION_DIM, device=dev)
             cev = torch.zeros(batch, T, dtype=torch.long, device=dev)
             cpose = torch.rand(batch, T, wm.POSE_DIM, device=dev)
 
         def one_step():
             with wm.autocast(dev, amp):
-                if arch == "causal":
+                if arch in ("causal", "world"):
                     loss = causal.training_loss(model, clip, cact, cev, cpose, mem, mem_pose)
                 else:
                     loss = wm.training_loss(model, ctx, tgt, act, ev, mem, mem_pose)
@@ -146,7 +156,7 @@ def main():
     ap.add_argument("--cache-dir", type=Path, default=Path("."))
     ap.add_argument("--batches", default=None,
                     help="default 64,128,256 (memory) or 4,8 clips (causal)")
-    ap.add_argument("--arch", choices=["causal", "memory"], default="causal")
+    ap.add_argument("--arch", choices=["world", "causal", "memory"], default="world")
     ap.add_argument("--size", default="large")
     ap.add_argument("--amps", default="fp16,bf16")
     ap.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -158,7 +168,7 @@ def main():
     ARGS = args
     if args.batches is None:
         # v3: whole clips per step; 16 large clips can overflow 16 GB into slow shared memory
-        args.batches = "4,8" if args.arch == "causal" else "64,128,256"
+        args.batches = "4,8" if args.arch in ("causal", "world") else "64,128,256"
 
     if args.worker:
         print(json.dumps(worker(args.amp, args.batch, args.seconds, args.warmup, args.arch,

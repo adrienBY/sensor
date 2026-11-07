@@ -157,3 +157,21 @@ pose relative to the newest frame, memory frames as prefix tokens, action dropou
 guidance, and gradient checkpointing. Sizes (`"model_size"` in `settings.json`): base 58M,
 large 174M (default), xl 384M. When dreaming it re-runs the last 12 frames each step. New runs
 go to `runs\v3`; earlier models stay in their folders (`"run": "memory"` uses the v2 model).
+
+## Model v4: the permanent architecture (default for new runs)
+
+v3's design plus every choice that cannot change after training starts, made generously, so
+the same model keeps training as footage grows:
+
+- **512x288 frames** (4x the pixels of 256x144) through 4x4 latent patches: still 144 tokens per
+  frame, so the cost per frame is unchanged. Frames are deleted after encoding to save disk;
+  the data lives in `data\processed_512x288`.
+- **Flow matching** instead of EDM: straight paths from noise to frame, the basis for few-step
+  distillation later.
+- **Muon optimiser** for the transformer's weight matrices (AdamW for the rest).
+- **Multi-speed clips**: some clips take every 2nd, 3rd or 4th frame, with actions computed from
+  the camera poses and the speed given to the model.
+- **Room and lighting conditioning** (32 room and 16 lighting slots) and 256 tag slots, so new
+  rooms, lighting and interactions never need a new model.
+
+New runs go to `runs\world`; older models stay in their folders.

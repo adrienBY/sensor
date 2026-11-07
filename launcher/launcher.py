@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 9
+LAUNCHER_VERSION = 10
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -35,10 +35,10 @@ ROCM_SDK = [
 ]
 TORCH = [ROCM + "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"]
 EXTRA = ["numpy", "opencv-python", "diffusers", "safetensors", "accelerate"]
-DEFAULT_SETTINGS = {"train_minutes": 60, "fps": 15, "width": 256, "height": 144,
-                    "amp": "fp16", "batch": 8, "tunableop": False, "dream_steps": 3,
-                    "run": "v3", "action_guidance": 1.0, "arch": "causal", "model_size": "large"}
-MODEL_VERSION = "v3"       # + arch and size: the benchmark re-runs when the model changes
+DEFAULT_SETTINGS = {"model_version": 4, "train_minutes": 60, "fps": 15, "width": 512, "height": 288,
+                    "amp": "fp16", "batch": 8, "tunableop": False, "dream_steps": 4,
+                    "run": "world", "action_guidance": 1.0, "arch": "world", "model_size": "large"}
+MODEL_VERSION = "v4"       # + arch and size: the benchmark re-runs when the model changes
 
 FROZEN = getattr(sys, "frozen", False)
 BUNDLE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -47,7 +47,7 @@ HOME = Path(os.environ.get("WORLDMODEL_HOME") or
 RUNTIME = HOME / ".runtime"
 APP = RUNTIME / "app"
 RAW = HOME / "data" / "raw" / "SensorCapture"
-PROCESSED = HOME / "data" / "processed"
+PROCESSED = HOME / "data" / "processed"   # per resolution, set in main()
 RUN = HOME / "runs" / "memory"   # set from settings.json "run" in main()
 LOGS = HOME / "logs"
 LOG_FILE = None
@@ -217,10 +217,10 @@ def settings():
     if path.exists():
         try:
             saved = json.loads(path.read_text())
-            if "arch" not in saved:            # settings from before v3: move to the v3 model
-                for k in ("run", "batch", "arch", "model_size"):
+            if saved.get("model_version") != 4:   # older settings: move to the permanent model
+                for k in ("run", "batch", "arch", "model_size", "width", "height", "tuned_model",
+                          "dream_steps", "model_version"):
                     saved.pop(k, None)
-                saved.pop("tuned_model", None)
                 path.write_text(json.dumps({**s, **saved}, indent=2))
             s.update(saved)
         except ValueError:
@@ -278,7 +278,8 @@ def process(py, s):
     if not step(py, "2/3  Aligning video and sensors, computing actions", "preprocess.py",
                 RAW, PROCESSED, "--width", s["width"], "--height", s["height"], "--fps", s["fps"]):
         return False
-    return step(py, "3/3  Encoding frames into latents (GPU)", "encode_latents.py", PROCESSED)
+    drop = ["--drop-frames"] if s["width"] > 256 else []
+    return step(py, "3/3  Encoding frames into latents (GPU)", "encode_latents.py", PROCESSED, *drop)
 
 
 def tune(py, s):
@@ -301,7 +302,7 @@ def tune(py, s):
         say(f"Saved to settings.json: {b['amp']}, batch {b['batch']}, "
             f"TunableOp {'on' if b['tunableop'] else 'off'}")
     else:
-        if s.get("arch") == "causal":
+        if s.get("arch") in ("causal", "world"):
             s["batch"] = 8
         say(f"Using safe defaults ({s['amp']}, batch {s['batch']}, TunableOp off). To measure "
             'again, delete the "tuned_gpu" line from settings.json.')
@@ -313,6 +314,10 @@ def tune(py, s):
 
 def train(py, s, minutes=None):
     minutes = minutes or s["train_minutes"]
+    if not any(PROCESSED.glob("*/latents.npy")):     # e.g. first run at a new resolution
+        say(f"No footage prepared at {s['width']}x{s['height']} yet: preparing it first.")
+        if not process(py, s):
+            return False
     s = tune(py, s)
     ok = step(py, f"Training the world model for {minutes} minutes (Ctrl+C stops and saves)",
               "train.py", PROCESSED, RUN, "--minutes", minutes, "--amp", s["amp"],
@@ -503,7 +508,7 @@ def single_instance():
 
 
 def main():
-    global LOG_FILE, RUN
+    global LOG_FILE, RUN, PROCESSED
     if not single_instance():
         print("WorldModel is already running in another window for this folder.")
         print("Use that window, or close it first. Press Enter to close this one.")
@@ -519,7 +524,9 @@ def main():
     try:
         say(f"World Model launcher v{LAUNCHER_VERSION}  ·  folder: {HOME}")
         s = settings()
-        RUN = HOME / "runs" / str(s.get("run") or "v3")
+        RUN = HOME / "runs" / str(s.get("run") or "world")
+        if (s["width"], s["height"]) != (256, 144):      # 256x144 data stays in data/processed
+            PROCESSED = HOME / "data" / f"processed_{s['width']}x{s['height']}"
         if not (RUN / "last.pt").exists() and any((HOME / "runs").glob("*/last.pt")):
             say(f"New model ({s['arch']}, size {s['model_size']}): it trains from scratch in "
                 f"runs\\{RUN.name}. Earlier models stay in their folders; set \"run\" in "

@@ -105,7 +105,7 @@ def make_dream_video(model, take, stats, vae, out_path: Path, fps, seconds=10, s
     real_img = decode(vae, real, stats, dtype)
 
     h, w = real_img.shape[1:3]
-    scale = 3
+    scale = max(1, 432 // h)            # 3x at 144 px high, 1x at 288
     out_path.parent.mkdir(parents=True, exist_ok=True)
     vw = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps,
                          (w * scale * 2 + 8, h * scale))

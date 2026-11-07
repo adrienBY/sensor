@@ -1,4 +1,11 @@
-"""World model v3: a frame-causal diffusion transformer trained on whole clips.
+"""World model v3 / v4: a frame-causal diffusion transformer trained on whole clips.
+
+v4 ("world", the permanent architecture) adds: flow matching instead of EDM (straight paths
+from noise to frame, the basis for few-step distillation later), 512x288 frames through 4x4
+latent patches (same token count as v3 at 256x144), room / lighting / clip-speed conditioning
+with reserved slots, and 256 tag slots. Every choice that cannot change after training starts
+is made generously, so the same model can keep training as footage grows.
+
 
 What changes from v2 (worldmodel.WorldDiT), and why:
   * Whole-clip training. The network sees a clip of CLIP frames and predicts every frame at
@@ -105,13 +112,19 @@ class Block(nn.Module):
 
 class CausalWorldDiT(nn.Module):
     def __init__(self, latent_shape, size="large", patch=2, n_events=64, mem_k=wm.NEW_MEM_K,
-                 mem_patch=(3, 4), clip=CLIP, window=WINDOW, arch="causal"):
+                 mem_patch=(3, 4), clip=CLIP, window=WINDOW, arch="causal", objective="edm",
+                 n_rooms=0, n_lights=0, max_stride=1):
         super().__init__()
         ch, h, w = latent_shape
         dim, depth, heads = SIZES[size]
-        self.config = dict(arch="causal", latent_shape=list(latent_shape), size=size, patch=patch,
+        self.config = dict(arch=arch, latent_shape=list(latent_shape), size=size, patch=patch,
                            n_events=n_events, mem_k=mem_k, mem_patch=list(mem_patch), clip=clip,
-                           window=window)
+                           window=window, objective=objective, n_rooms=n_rooms,
+                           n_lights=n_lights, max_stride=max_stride)
+        self.objective, self.max_stride = objective, max_stride
+        self.room = nn.Embedding(n_rooms + 1, dim) if n_rooms else None
+        self.light = nn.Embedding(n_lights + 1, dim) if n_lights else None
+        self.stride = nn.Embedding(max_stride + 1, dim) if max_stride > 1 else None
         self.ch, self.h, self.w, self.p = ch, h, w, patch
         self.dim, self.heads, self.mem_k, self.mem_patch = dim, heads, mem_k, tuple(mem_patch)
         self.clip, self.window = clip, window
@@ -168,7 +181,8 @@ class CausalWorldDiT(nn.Module):
         self._cache[key] = (mask, cos, sin, group, nm)
         return self._cache[key]
 
-    def forward(self, x, c_noise, act, ev, pose, mem=None, mem_pose=None):
+    def forward(self, x, c_noise, act, ev, pose, mem=None, mem_pose=None, room=None, light=None,
+                stride=None):
         """x [B, T, C, H, W] (noisy, already scaled by c_in), c_noise [B, T], act [B, T, 7]
         (action into each frame), ev [B, T], pose [B, T, POSE_DIM] (relative to the newest
         frame) -> denoiser output [B, T, C, H, W]."""
@@ -176,6 +190,11 @@ class CausalWorldDiT(nn.Module):
         tok = self.embed(wm.patchify(x.flatten(0, 1), self.p, self.p)).view(b, -1, self.dim)
         cond = (self.noise_mlp(wm.fourier(c_noise.flatten())).view(b, t, -1) + self.act_mlp(act)
                 + self.event(ev.clamp(0, self.event.num_embeddings - 1)) + self.pose_mlp(pose))
+        for emb, ids in ((self.room, room), (self.light, light), (self.stride, stride)):
+            if emb is not None:                       # per clip, shared by all its frames
+                if ids is None:
+                    ids = torch.full((b,), 1 if emb is self.stride else 0, device=x.device)
+                cond = cond + emb(ids.clamp(0, emb.num_embeddings - 1))[:, None]
         k = self.mem_k
         if k:
             if mem is None:
@@ -236,7 +255,53 @@ def precond(sigma):
     return c_skip, c_out, c_in, sigma.log() / 4
 
 
-def training_loss(model, x0, act, ev, pose, mem=None, mem_pose=None, own=None, own_mask=None):
+FLOW_CTX_T = 0.05     # flow matching: noise level of history frames when dreaming
+FLOW_SHIFT = 3.0      # flow matching: sampling schedule spends more steps at high noise
+
+
+def _objective(model):
+    m = getattr(model, "_orig_mod", getattr(model, "model", model))
+    return getattr(m, "objective", "edm")
+
+
+def flow_loss(model, x0, act, ev, pose, mem=None, mem_pose=None, own=None, own_mask=None,
+              **scene):
+    """Flow matching with per-frame noise (diffusion forcing): x_t = (1-t) x0 + t noise, the
+    network predicts the velocity (x_t - x0) / t. Half the clips keep a nearly clean history,
+    like dreaming; those history frames are context only (predicting the noise of an almost
+    clean frame teaches nothing). Self-forced frames: the model's own drawings stand in for
+    the real frames as inputs, and the real frames stay the targets."""
+    b, t = x0.shape[:2]
+    dev = x0.device
+    tt = torch.sigmoid(torch.randn(b, t, device=dev))          # logit-normal noise levels
+    hist = torch.rand(b, device=dev) < 0.5
+    n_new = torch.randint(1, 4, (b,), device=dev)
+    is_hist = (torch.arange(t, device=dev)[None] < (t - n_new)[:, None]) & hist[:, None]
+    tt = torch.where(is_hist, torch.rand(b, t, device=dev) * 3 * FLOW_CTX_T, tt)
+    base = x0
+    if own is not None:
+        lo, hi = SELF_SIGMA
+        tt = torch.where(own_mask, 0.25 + torch.rand(b, t, device=dev) * 0.5, tt)
+        base = torch.where(own_mask[..., None, None, None], own, x0)
+    t5 = tt[..., None, None, None]
+    xt = (1 - t5) * base + t5 * torch.randn_like(x0)
+    target = (xt - x0) / t5.clamp_min(0.02)
+    pred = model(xt, (tt - 0.5) * 2, act, ev, pose, mem, mem_pose, **scene)
+    w = (~is_hist).float()
+    if own is not None:
+        w = torch.where(own_mask, torch.ones_like(w), w)
+    err = (pred.float() - target.float()).pow(2).mean(dim=(2, 3, 4))
+    return (err * w).sum() / w.sum().clamp_min(1)
+
+
+def training_loss(model, x0, act, ev, pose, mem=None, mem_pose=None, own=None, own_mask=None,
+                  **scene):
+    if _objective(model) == "flow":
+        return flow_loss(model, x0, act, ev, pose, mem, mem_pose, own, own_mask, **scene)
+    return edm_loss(model, x0, act, ev, pose, mem, mem_pose, own, own_mask)
+
+
+def edm_loss(model, x0, act, ev, pose, mem=None, mem_pose=None, own=None, own_mask=None):
     """Diffusion forcing over a clip x0 [B, T, ...]: every frame gets its own noise level and
     every frame is a target. For half the clips, the history is kept nearly clean (as when
     dreaming) and only the newest frames are heavily noised. `own` / `own_mask` [B, T]:
@@ -263,10 +328,36 @@ def training_loss(model, x0, act, ev, pose, mem=None, mem_pose=None, own=None, o
 
 
 @torch.no_grad()
+def sample_flow(model, hist, act, ev, pose, mem=None, mem_pose=None, steps=4, guidance=1.0,
+                **scene):
+    b, n = hist.shape[:2]
+    dev = hist.device
+    hist = (1 - FLOW_CTX_T) * hist + FLOW_CTX_T * torch.randn_like(hist)
+    u = torch.linspace(1, 0, steps + 1, device=dev)
+    ts = FLOW_SHIFT * u / (1 + (FLOW_SHIFT - 1) * u)
+    x = torch.randn(b, *hist.shape[2:], device=dev)
+    null = wm.null_event(model)
+    for i in range(steps):
+        tv = torch.cat([torch.full((b, n), FLOW_CTX_T, device=dev), ts[i].expand(b, 1)], 1)
+        inp = torch.cat([hist, x[:, None]], 1)
+        v = model(inp, (tv - 0.5) * 2, act, ev, pose, mem, mem_pose, **scene)[:, -1].float()
+        if guidance != 1.0:
+            act_u, ev_u = act.clone(), ev.clone()
+            act_u[:, -1] = 0
+            ev_u[:, -1] = null
+            vu = model(inp, (tv - 0.5) * 2, act_u, ev_u, pose, mem, mem_pose, **scene)[:, -1].float()
+            v = vu + guidance * (v - vu)
+        x = x + (ts[i + 1] - ts[i]) * v
+    return x
+
+
+@torch.no_grad()
 def sample_next(model, hist, act, ev, pose, mem=None, mem_pose=None, steps=3, ctx_noise=0.05,
-                guidance=1.0, sigma_min=0.002, sigma_max=5.0, rho=7.0):
+                guidance=1.0, sigma_min=0.002, sigma_max=5.0, rho=7.0, **scene):
     """hist [B, W-1, ...] past frames; act / ev / pose [B, W] for every frame of the window
     including the new one (pose relative to the new frame). Returns the new frame [B, ...]."""
+    if _objective(model) == "flow":
+        return sample_flow(model, hist, act, ev, pose, mem, mem_pose, steps, guidance, **scene)
     b, n = hist.shape[:2]
     dev = hist.device
     hist = hist + ctx_noise * torch.randn_like(hist)
@@ -300,7 +391,11 @@ class Rollout:
 
     def __init__(self, model, take, start, device, net=None):
         self.model, self.net, self.dev = model, net or model, device
-        self.causal = model.config.get("arch") == "causal"
+        self.causal = model.config.get("arch") in ("causal", "world")
+        self.scene = {}
+        if model.config.get("n_rooms"):
+            self.scene = {"room": torch.tensor([take.get("room", 0)], device=device),
+                          "light": torch.tensor([take.get("light", 0)], device=device)}
         self.take, self.has = take, float(take["has"])
         c = model.context
         lat = take["lat"]
@@ -331,7 +426,7 @@ class Rollout:
             z = sample_next(self.net, hist, torch.from_numpy(acts)[None].to(self.dev),
                             torch.tensor([evs], device=self.dev),
                             torch.from_numpy(np.stack(rel))[None].to(self.dev),
-                            mem, mem_pose, steps=steps, guidance=guidance)[0]
+                            mem, mem_pose, steps=steps, guidance=guidance, **self.scene)[0]
         self.frames.append(z.float())
         self.acts.append(np.asarray(action, np.float32))
         self.evs.append(int(event))

@@ -40,6 +40,21 @@ W_FAST_TURN = 2.0    # the camera turns fast in the target step
 FAST_TURN = 0.15     # rad per frame (~130 deg/s at 15 fps)
 W_BLURRY = 0.3       # the target frame is much blurrier than the take's median
 BLURRY = 0.5         # "much blurrier": sharpness under this share of the median
+# Scene labels from the capture app, with fixed ids (0 = unknown) so a model trained today keeps
+# understanding them later. Models reserve more slots than listed, for rooms and lighting to come.
+ROOMS = ["corridor", "living room", "kitchen", "my room", "bathroom", "parents' room",
+         "whole apartment", "other"]
+LIGHTS = ["daylight", "evening, lights on", "night, lights on", "night, lights off", "mixed"]
+N_ROOMS, N_LIGHTS = 32, 16
+STRIDES = (1, 2, 3, 4)               # multi-speed clips: every frame, every 2nd, 3rd, 4th
+STRIDE_P = (0.6, 0.25, 0.1, 0.05)
+
+
+def scene_id(name, vocab):
+    n = (name or "").strip().lower()
+    return vocab.index(n) + 1 if n in vocab else 0
+
+
 # Mirror augmentation: flipping left-right negates these action / memory-pose components
 # (rotation about Y and Z, movement along X; the camera looks along -Z with +X to the right).
 MIRROR_ACT = (1, -1, -1, -1, 1, 1, 1)
@@ -222,6 +237,7 @@ class Dataset:
                 "ev": a["event"].astype(np.int64),
                 "R": r, "p": p, "has": bool(has.any()),
                 "turn": np.linalg.norm(rot, axis=1), "sharp": sharp,
+                "room": scene_id(e.get("room"), ROOMS), "light": scene_id(e.get("lighting"), LIGHTS),
             })
         if not self.takes:
             return
@@ -299,6 +315,7 @@ class Dataset:
         poses and memory candidates, all on the GPU."""
         self.clip, self.mem_k, self.mirror = clip, mem_k, mirror
         lat, act, ev, starts, weights, rs, ps, hs, mem_idx, mem_pose = ([] for _ in range(10))
+        first, last, room, light = [], [], [], []
         offset = 0
         for t in self.takes:
             n = len(t["lat"])
@@ -312,6 +329,10 @@ class Dataset:
             rs.append(t["R"].astype(np.float32))
             ps.append(t["p"].astype(np.float32))
             hs.append(np.full(n, t["has"]))
+            first.append(np.full(n, offset))
+            last.append(np.full(n, offset + n - 1))
+            room.append(np.full(n, t["room"]))
+            light.append(np.full(n, t["light"]))
             if n - clip > 1:                           # clips start at frame 1 (action into it)
                 local = np.arange(1, n - clip + 1)
                 starts.append(local + offset)
@@ -335,6 +356,8 @@ class Dataset:
         cat = lambda x: torch.from_numpy(np.concatenate(x)).to(device)
         self.g_lat, self.g_act, self.g_ev = cat(lat), cat(act), cat(ev)
         self.g_R, self.g_p, self.g_has = cat(rs), cat(ps), cat(hs)
+        self.g_first, self.g_last = cat(first), cat(last)
+        self.g_room, self.g_light = cat(room), cat(light)
         self.g_starts = cat(starts)
         w = np.concatenate(weights)
         self.g_weights = torch.from_numpy(w / w.sum()).float().to(device)
@@ -344,18 +367,41 @@ class Dataset:
             self.g_mem_idx, self.g_mem_pose = cat(mem_idx), cat(mem_pose)
         return self
 
-    def gpu_clip_batch(self, n):
-        """n clips: win [n, T, C, H, W], act / ev into each frame, R / p / has per frame,
-        pose [n, T, POSE_DIM] relative to the clip's last frame, and memory for that frame."""
+    def gpu_clip_batch(self, n, multi_stride=False):
+        """n clips: win [n, T, C, H, W]; act / ev into each frame; R / p / has per frame; pose
+        [n, T, POSE_DIM] relative to the clip's last frame; memory for that frame; room, light
+        and stride per clip. With multi_stride, some clips take every 2nd-4th frame, and the
+        action into each frame is then the camera motion since the previous clip frame,
+        computed from the poses (the tag is the latest one in that span)."""
         import causal
         dev = self.g_starts.device
         s = self.g_starts[torch.multinomial(self.g_weights, n, replacement=True)]
-        idx = s[:, None] + self.g_clip
-        out = {"win": self.g_lat[idx].float(), "act": self.g_act[idx - 1], "ev": self.g_ev[idx - 1],
-               "R": self.g_R[idx], "p": self.g_p[idx], "has": self.g_has[idx]}
+        stride = torch.ones(n, dtype=torch.long, device=dev)
+        if multi_stride:
+            pick = torch.multinomial(torch.tensor(STRIDE_P, device=dev), n, replacement=True)
+            stride = torch.tensor(STRIDES, device=dev)[pick]
+            fits = s + (self.clip - 1) * stride <= self.g_last[s]
+            stride = torch.where(fits, stride, torch.ones_like(stride))
+        idx = s[:, None] + self.g_clip[None] * stride[:, None]
+        R, p, has = self.g_R[idx], self.g_p[idx], self.g_has[idx]
+        out = {"win": self.g_lat[idx].float(), "R": R, "p": p, "has": has, "stride": stride,
+               "room": self.g_room[s], "light": self.g_light[s]}
+        if multi_stride:
+            prev = torch.maximum(idx - stride[:, None], self.g_first[idx])
+            rel = causal.relative_pose_t(self.g_R[prev], self.g_p[prev], R, p, has)
+            h = rel[..., 6]
+            out["act"] = torch.cat([rel[..., :3] * ROT_SCALE, rel[..., 3:6] * TRANS_SCALE,
+                                    h[..., None]], -1)
+            ev = torch.zeros_like(idx)
+            for k in range(1, max(STRIDES) + 1):          # latest tag within the span
+                j = (idx - k).clamp(min=0)
+                ok = (k <= stride[:, None]) & (idx - k >= self.g_first[idx])
+                ev = torch.where(ok & (ev == 0), self.g_ev[j], ev)
+            out["ev"] = ev
+        else:
+            out["act"], out["ev"] = self.g_act[idx - 1], self.g_ev[idx - 1]
         last = idx[:, -1]
-        out["pose"] = causal.relative_pose_t(out["R"][:, -1:], out["p"][:, -1:], out["R"], out["p"],
-                                             out["has"])
+        out["pose"] = causal.relative_pose_t(R[:, -1:], p[:, -1:], R, p, has)
         if self.mem_k:
             cand, pose = self.g_mem_idx[last], self.g_mem_pose[last]
             pick = (torch.rand(cand.shape, device=dev) + (cand >= 0)).topk(self.mem_k, 1).indices
@@ -605,17 +651,21 @@ class GraphedModel:
         self.model, self.amp = model, amp
         self.graphs, self.failed = {}, False
         self.context, self.mem_k, self.event = model.context, model.mem_k, model.event
+        self.config = model.config
 
-    def __call__(self, *args):
+    def __call__(self, *args, **kw):
         dev = args[0].device
         if self.failed or dev.type != "cuda":
-            return self.model(*args)
-        key = tuple(None if a is None else (tuple(a.shape), a.dtype) for a in args)
+            return self.model(*args, **kw)
+        names = tuple(sorted(kw))
+        allin = tuple(args) + tuple(kw[k] for k in names)
+        key = (len(args), names) + tuple(None if a is None else (tuple(a.shape), a.dtype)
+                                         for a in allin)
         try:
             if key not in self.graphs:
-                self.graphs[key] = self._capture(args)
+                self.graphs[key] = self._capture(allin, len(args), names)
             g, ins, out = self.graphs[key]
-            for buf, a in zip(ins, args):
+            for buf, a in zip(ins, allin):
                 if buf is not None:
                     buf.copy_(a)
             g.replay()
@@ -623,23 +673,24 @@ class GraphedModel:
         except Exception as e:  # graphs unsupported here: run normally from now on
             print(f"GPU graph replay unavailable ({type(e).__name__}); running normally.")
             self.failed = True
-            return self.model(*args)
+            return self.model(*args, **kw)
 
-    def _capture(self, args):
-        ins = [None if a is None else a.clone() for a in args]
+    def _capture(self, allin, n_pos, names):
+        ins = [None if a is None else a.clone() for a in allin]
+        call = lambda: self.model(*ins[:n_pos], **dict(zip(names, ins[n_pos:])))
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side), torch.autocast("cuda", dtype=AMP_DTYPES.get(self.amp) or torch.float32,
                                                      enabled=AMP_DTYPES.get(self.amp) is not None,
                                                      cache_enabled=False):
             for _ in range(3):
-                self.model(*ins)
+                call()
         torch.cuda.current_stream().wait_stream(side)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g), torch.autocast("cuda", dtype=AMP_DTYPES.get(self.amp) or torch.float32,
                                                  enabled=AMP_DTYPES.get(self.amp) is not None,
                                                  cache_enabled=False):
-            out = self.model(*ins)
+            out = call()
         return g, ins, out
 
 
@@ -693,7 +744,7 @@ def upgrade_state_dict(sd):
 
 def build_model(config):
     cfg = dict(config)
-    if cfg.get("arch") == "causal":
+    if cfg.get("arch") in ("causal", "world"):
         import causal
         return causal.CausalWorldDiT(tuple(cfg.pop("latent_shape")), **cfg)
     return WorldDiT(tuple(cfg.pop("latent_shape")), **cfg)

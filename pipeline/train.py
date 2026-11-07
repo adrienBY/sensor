@@ -78,14 +78,103 @@ def eval_clips(run, data, context, fps, seconds=10):
     return clips
 
 
-def make_optimizer(model, lr):
+def newton_schulz(g, steps=5):
+    """Approximately orthogonalise a matrix (Muon's quintic Newton-Schulz iteration)."""
+    a, b, c = 3.4445, -4.7750, 2.0315
+    x = g.float()
+    x = x / (x.norm() + 1e-7)
+    tall = x.shape[0] > x.shape[1]
+    if tall:
+        x = x.T
+    for _ in range(steps):
+        m = x @ x.T
+        x = a * x + (b * m + c * m @ m) @ x
+    return x.T if tall else x
+
+
+class Muon(torch.optim.Optimizer):
+    """Muon (Jordan et al., 2024): momentum, then the update of each weight matrix is
+    orthogonalised so all its directions learn at a similar rate. Reaches a given loss in
+    fewer steps than AdamW on transformer weight matrices. Used for the 2D weights inside the
+    transformer blocks; embeddings, norms and output layers stay on AdamW."""
+
+    def __init__(self, params, lr=0.02, momentum=0.95, weight_decay=0.01):
+        super().__init__(params, dict(lr=lr, momentum=momentum, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        for g in self.param_groups:
+            for p in g["params"]:
+                if p.grad is None:
+                    continue
+                st = self.state[p]
+                if "buf" not in st:
+                    st["buf"] = torch.zeros_like(p)
+                buf = st["buf"]
+                buf.mul_(g["momentum"]).add_(p.grad)
+                u = newton_schulz(p.grad.add(buf, alpha=g["momentum"]))
+                p.mul_(1 - g["lr"] * g["weight_decay"])
+                p.add_(u.to(p.dtype), alpha=-g["lr"] * max(1.0, p.shape[0] / p.shape[1]) ** 0.5)
+
+
+class Combined:
+    """Several optimizers driven as one (works with the FP16 loss scaler and checkpoints)."""
+
+    def __init__(self, *opts):
+        self.opts = opts
+
+    @property
+    def param_groups(self):
+        return [g for o in self.opts for g in o.param_groups]
+
+    @property
+    def state(self):
+        return {k: v for o in self.opts for k, v in o.state.items()}
+
+    def zero_grad(self, set_to_none=True):
+        for o in self.opts:
+            o.zero_grad(set_to_none=set_to_none)
+
+    def step(self):
+        for o in self.opts:
+            o.step()
+
+    def state_dict(self):
+        return {"combined": [o.state_dict() for o in self.opts]}
+
+    def load_state_dict(self, sd):
+        if "combined" not in sd or len(sd["combined"]) != len(self.opts):
+            raise ValueError("optimizer layout changed")
+        for o, d in zip(self.opts, sd["combined"]):
+            o.load_state_dict(d)
+
+
+def make_optimizer(model, lr, muon=False):
+    if muon:
+        names = dict(model.named_parameters())
+        mats = [p for n, p in names.items() if n.startswith("blocks.") and p.ndim == 2]
+        ids = {id(p) for p in mats}
+        rest = [p for p in names.values() if id(p) not in ids]
+        adam, kind = make_optimizer_params(rest, lr, next(model.parameters()).is_cuda)
+        mu = Muon(mats, lr=0.02)
+        for g in adam.param_groups:
+            g["base_lr"] = lr
+        for g in mu.param_groups:
+            g["base_lr"] = 0.02
+        return Combined(mu, adam), f"Muon ({sum(p.numel() for p in mats) / 1e6:.0f}M) + AdamW {kind}"
+    opt, kind = make_optimizer_params(list(model.parameters()), lr,
+                                      next(model.parameters()).is_cuda)
+    return opt, kind
+
+
+def make_optimizer_params(params, lr, cuda):
     kw = dict(lr=lr, betas=(0.9, 0.99), weight_decay=0.01)
-    if next(model.parameters()).is_cuda:
+    if cuda:
         try:
-            return torch.optim.AdamW(model.parameters(), fused=True, **kw), "fused"
+            return torch.optim.AdamW(params, fused=True, **kw), "fused"
         except (RuntimeError, TypeError, ValueError):
             pass
-    return torch.optim.AdamW(model.parameters(), foreach=True, **kw), "foreach"
+    return torch.optim.AdamW(params, foreach=True, **kw), "foreach"
 
 
 def main():
@@ -104,8 +193,10 @@ def main():
     ap.add_argument("--dream-every", type=float, default=20, help="minutes between dream videos")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-dreams", action="store_true", help="skip dream videos (testing)")
-    ap.add_argument("--arch", choices=["causal", "memory"], default="causal",
-                    help="new models: causal = v3 (whole-clip, ~174M at size large), memory = v2")
+    ap.add_argument("--arch", choices=["world", "causal", "memory"], default="world",
+                    help="new models: world = v4, the permanent architecture (default); "
+                         "causal = v3; memory = v2")
+    ap.add_argument("--no-muon", action="store_true", help="AdamW only (v4 uses Muon by default)")
     ap.add_argument("--size", choices=list(causal.SIZES), default="large", help="v3 model size")
     ap.add_argument("--clip", type=int, default=causal.CLIP, help="v3 frames per training clip")
     ap.add_argument("--lr-causal", type=float, default=2e-4, help="v3 learning rate at 8 clips")
@@ -161,6 +252,13 @@ def main():
     if ck:
         model = wm.build_model(ck["config"]).to(device)
         model.load_state_dict(wm.upgrade_state_dict(ck["model"]))
+    elif args.arch == "world":
+        big = train.latent_shape[1] >= 36           # 512x288 frames -> 36x64 latents
+        model = causal.CausalWorldDiT(
+            train.latent_shape, size=args.size, clip=args.clip, mem_k=args.memory,
+            arch="world", objective="flow", patch=4 if big else 2,
+            mem_patch=(6, 8) if big else (3, 4), n_events=256, n_rooms=wm.N_ROOMS,
+            n_lights=wm.N_LIGHTS, max_stride=max(wm.STRIDES)).to(device)
     elif args.arch == "causal":
         model = causal.CausalWorldDiT(train.latent_shape, size=args.size, clip=args.clip,
                                       mem_k=args.memory).to(device)
@@ -172,7 +270,8 @@ def main():
         model = wm.WorldDiT(train.latent_shape, dim=args.dim, depth=args.depth,
                             heads=args.dim // 64, context=args.context,
                             mem_k=args.memory).to(device)
-    is_causal = model.config.get("arch") == "causal"
+    is_causal = model.config.get("arch") in ("causal", "world")
+    is_world = model.config.get("arch") == "world"
     if is_causal:
         model.grad_ckpt = model.config["size"] in ("large", "xl")   # fits 16 GB
         if args.batch > 32:                   # a v2-sized batch would be 64 whole clips
@@ -201,12 +300,12 @@ def main():
     # Larger batches on a big GPU: scale the learning rate with sqrt(batch / 64).
     lr = (args.lr_causal * math.sqrt(args.batch / 8) if is_causal
           else args.lr * math.sqrt(args.batch / 64))
-    opt, opt_kind = make_optimizer(model, lr)
+    opt, opt_kind = make_optimizer(model, lr, muon=is_world and not args.no_muon)
     if ck and ck.get("opt"):
         try:
             opt.load_state_dict(ck["opt"])
             for g in opt.param_groups:
-                g["lr"] = lr
+                g["lr"] = g.get("base_lr", lr)
             for p, st in opt.state.items():           # moments of a reshaped (upgraded) weight
                 for k, v in st.items():
                     if torch.is_tensor(v) and v.dim() and v.shape != p.shape and v.numel() == p.numel():
@@ -218,6 +317,11 @@ def main():
     start_step = step
     minutes_before = ck.get("minutes_trained", 0.0) if ck else 0.0
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    if is_world:
+        print(f"v4 world model (permanent architecture), size {model.config['size']}: "
+              f"{train.latent_shape[2] * 8}x{train.latent_shape[1] * 8} frames, clips of "
+              f"{model.clip} frames at 1-{model.max_stride}x speed, flow matching, room + lighting "
+              f"conditioning, {model.config['n_events']} tag slots")
     if is_causal:
         print(f"v3 causal model, size {model.config['size']}: clips of {model.clip} frames, "
               f"every frame a target, diffusion forcing, QK-norm, 3D RoPE, window {model.window}"
@@ -328,8 +432,13 @@ def main():
 
     def causal_step():
         """v3: a batch of whole clips, every frame a target (diffusion forcing)."""
-        b = train.gpu_clip_batch(args.batch)
+        b = train.gpu_clip_batch(args.batch, multi_stride=getattr(model, "max_stride", 1) > 1)
         win, act, ev = b["win"], b["act"], b["ev"]
+        scene = {}
+        if model.config.get("n_rooms"):
+            scene = {"room": b["room"], "light": b["light"]}
+        if getattr(model, "max_stride", 1) > 1:
+            scene["stride"] = b["stride"]
         mem, mem_pose = b.get("mem"), b.get("mem_pose")
         if args.action_dropout > 0:                       # per frame: "action unknown"
             drop = torch.rand(act.shape[:2], device=act.device) < args.action_dropout
@@ -356,13 +465,14 @@ def main():
                     z = causal.sample_next(model, own[:nb, lo:pos], act[:nb, lo:pos + 1],
                                            ev[:nb, lo:pos + 1], pw,
                                            None if mem is None else mem[:nb],
-                                           None if mem_pose is None else mem_pose[:nb], steps=2)
+                                           None if mem_pose is None else mem_pose[:nb], steps=2,
+                                           **{k: v[:nb] for k, v in scene.items()})
                     own[:nb, pos] = z.float()
             own_mask = torch.zeros(win.shape[:2], dtype=torch.bool, device=device)
             own_mask[:nb, T - k:] = True
         with wm.autocast(device, args.amp):
             return causal.training_loss(fwd_model, win, act, ev, b["pose"], mem, mem_pose,
-                                        own, own_mask)
+                                        own, own_mask, **scene)
 
     budget = args.minutes * 60
     null_ev = wm.null_event(model)
@@ -378,7 +488,7 @@ def main():
         if args.decay > 0 and frac > 1 - args.decay:
             f *= max(0.02, (1 - frac) / args.decay)
         for g in opt.param_groups:
-            g["lr"] = lr * f
+            g["lr"] = g.get("base_lr", lr) * f
         loss = causal_step() if is_causal else memory_step()
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
