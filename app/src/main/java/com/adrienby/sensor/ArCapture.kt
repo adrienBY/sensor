@@ -256,17 +256,18 @@ class ArCapture(private val activity: Activity, private val glView: GLSurfaceVie
         } catch (e: Exception) {
             return
         }
+        // Map the screen quad onto the camera texture every frame (4 points, negligible cost).
+        // Doing it only when hasDisplayGeometryChanged() is true misses that one frame if it
+        // arrives before the camera has produced an image, leaving every UV at 0: the whole
+        // preview then shows one magnified texel, i.e. shifting blurry colours.
+        quad.position(0)
+        uv.position(0)
+        frame.transformCoordinates2d(
+            Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES, quad,
+            Coordinates2d.TEXTURE_NORMALIZED, uv
+        )
         val ts = frame.timestamp
         if (ts == 0L) return
-
-        if (frame.hasDisplayGeometryChanged()) {
-            quad.position(0)
-            uv.position(0)
-            frame.transformCoordinates2d(
-                Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES, quad,
-                Coordinates2d.TEXTURE_NORMALIZED, uv
-            )
-        }
         drawBackground()
 
         if (ts == lastTimestamp) return
