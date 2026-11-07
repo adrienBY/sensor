@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 6
+LAUNCHER_VERSION = 7
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -36,7 +36,9 @@ ROCM_SDK = [
 TORCH = [ROCM + "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"]
 EXTRA = ["numpy", "opencv-python", "diffusers", "safetensors", "accelerate"]
 DEFAULT_SETTINGS = {"train_minutes": 60, "fps": 15, "width": 256, "height": 144,
-                    "amp": "fp16", "batch": 64, "tunableop": False, "dream_steps": 3}
+                    "amp": "fp16", "batch": 64, "tunableop": False, "dream_steps": 3,
+                    "run": "memory"}
+MODEL_VERSION = "memory-1"   # the benchmark re-runs once when the model architecture changes
 
 FROZEN = getattr(sys, "frozen", False)
 BUNDLE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -46,7 +48,7 @@ RUNTIME = HOME / ".runtime"
 APP = RUNTIME / "app"
 RAW = HOME / "data" / "raw" / "SensorCapture"
 PROCESSED = HOME / "data" / "processed"
-RUN = HOME / "runs" / "main"
+RUN = HOME / "runs" / "memory"   # set from settings.json "run" in main()
 LOGS = HOME / "logs"
 LOG_FILE = None
 
@@ -277,7 +279,7 @@ def tune(py, s):
     """Benchmark once per GPU: the fastest precision, batch size and TunableOp on this card.
     Delete "tuned_gpu" from settings.json to measure again."""
     gpu = gpu_name(py)
-    if not gpu or s.get("tuned_gpu") == gpu:
+    if not gpu or (s.get("tuned_gpu") == gpu and s.get("tuned_model") == MODEL_VERSION):
         return s
     out = RUNTIME / "bench.json"
     if out.exists():
@@ -294,7 +296,7 @@ def tune(py, s):
         say(f"Using safe defaults ({s['amp']}, batch {s['batch']}, TunableOp off). To measure "
             'again, delete the "tuned_gpu" line from settings.json.')
         s["tunableop"] = False
-    s["tuned_gpu"] = gpu
+    s["tuned_gpu"], s["tuned_model"] = gpu, MODEL_VERSION
     save_settings(s)
     return s
 
@@ -379,7 +381,7 @@ def menu(py, s):
         trained = (RUN / "last.pt").exists()
         n_raw = len(list(RAW.glob("*/meta.json"))) if RAW.exists() else 0
         say()
-        say(f"World Model  ·  {HOME}")
+        say(f"World Model  ·  {HOME}  ·  model: runs\\{RUN.name}")
         say(f"{n_raw} takes  ·  model {'trained' if trained else 'not trained yet'}  ·  "
             f"training runs {s['train_minutes']} min (settings.json)")
         say("  1  Add footage (pick a folder) and run everything")
@@ -467,7 +469,7 @@ def single_instance():
 
 
 def main():
-    global LOG_FILE
+    global LOG_FILE, RUN
     if not single_instance():
         print("WorldModel is already running in another window for this folder.")
         print("Use that window, or close it first. Press Enter to close this one.")
@@ -483,6 +485,12 @@ def main():
     try:
         say(f"World Model launcher v{LAUNCHER_VERSION}  ·  folder: {HOME}")
         s = settings()
+        RUN = HOME / "runs" / str(s.get("run") or "memory")
+        if s["run"] == "memory" and (HOME / "runs" / "main" / "last.pt").exists() \
+                and not (RUN / "last.pt").exists():
+            say("New model version with memory: it trains from scratch in runs\\memory.")
+            say('Your previous model stays in runs\\main (set "run": "main" in settings.json '
+                "to use it again).")
         py = setup_runtime()
         install_scripts()
         gpu = gpu_name(py)

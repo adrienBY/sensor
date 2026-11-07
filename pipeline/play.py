@@ -47,12 +47,20 @@ def main():
     for i, v in enumerate(vocab[:9]):
         print(f"  {i + 1}: {v}")
 
+    c = model.context
+    state = {}
+
     def reset():
+        """Start from a real moment: its frames, and the camera pose of its last frame. Memory
+        then comes from that take's real frames, found by where the dream camera is."""
         t = random.choice(data.takes)
-        s = random.randint(0, len(t["lat"]) - wm.CONTEXT - 1)
-        return torch.from_numpy(t["lat"][s:s + wm.CONTEXT])[None].to(device)
+        s = random.randint(0, len(t["lat"]) - c - 1)
+        state.update(take=t, R=t["R"][s + c - 1].copy(), p=t["p"][s + c - 1].copy())
+        return torch.from_numpy(t["lat"][s:s + c])[None].to(device)
 
     ctx = reset()
+    if model.mem_k:
+        print(f"Memory: {model.mem_k} frames of the current take, picked by where you look.")
     win = "Dream (Q to quit)"
     cv2.namedWindow(win, cv2.WINDOW_AUTOSIZE)
     key = -1
@@ -80,8 +88,13 @@ def main():
         has_trans = 1.0 if np.any(trans) else 0.0
         a = torch.from_numpy(wm.action_vector(rot, trans, has_trans))[None].to(device)
         e = torch.tensor([event], device=device)
+        mem = mem_pose = None
+        state["R"], state["p"] = wm.apply_action(state["R"], state["p"], rot, trans * has_trans)
+        if model.mem_k:
+            mem, mem_pose = wm.memory_for(state["take"], state["R"], state["p"], model.mem_k,
+                                          device)
         with wm.autocast(device, args.amp):
-            z = wm.sample_next(model, ctx, a, e, steps=args.steps)
+            z = wm.sample_next(model, ctx, a, e, steps=args.steps, mem=mem, mem_pose=mem_pose)
         ctx = torch.cat([ctx[:, 1:], z[:, None].float()], dim=1)
         img = decode(vae, z, ck["stats"], dtype)[0]
         h, w = img.shape[:2]

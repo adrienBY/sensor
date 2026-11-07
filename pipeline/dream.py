@@ -6,6 +6,8 @@
 The model gets the real first frames of a validation take and the real camera motion, then
 imagines every following frame on its own. Left = what really happened, right = the dream.
 How long the right side stays recognisable is the main measure of progress.
+With a memory model, memory comes from the same take but never from the clip being predicted
+(nor 2 s around it), so the dream cannot copy the real future frames.
 """
 import argparse
 import json
@@ -40,14 +42,20 @@ def decode(vae, z_norm, stats, dtype, chunk=32):
 @torch.no_grad()
 def rollout(model, take, start, horizon, device, steps=3, amp="fp16"):
     lat, act, ev = take["lat"], take["act"], take["ev"]
-    ctx = torch.from_numpy(lat[start:start + wm.CONTEXT])[None].to(device)
+    c = model.context
+    ctx = torch.from_numpy(lat[start:start + c])[None].to(device)
+    exclude = (start - wm.MEM_GAP, start + c + horizon + wm.MEM_GAP)
     dreams = []
     for i in range(horizon):
-        k = start + wm.CONTEXT - 1 + i
+        k = start + c - 1 + i
         a = torch.from_numpy(act[k])[None].to(device)
         e = torch.tensor([ev[k]], device=device)
+        mem = mem_pose = None
+        if model.mem_k:                      # the real camera pose of the frame being dreamt
+            mem, mem_pose = wm.memory_for(take, take["R"][k + 1], take["p"][k + 1],
+                                          model.mem_k, device, exclude)
         with wm.autocast(device, amp):
-            z = wm.sample_next(model, ctx, a, e, steps=steps)
+            z = wm.sample_next(model, ctx, a, e, steps=steps, mem=mem, mem_pose=mem_pose)
         dreams.append(z.float())
         ctx = torch.cat([ctx[:, 1:], z[:, None].to(ctx.dtype)], dim=1)
     return torch.cat(dreams)
@@ -66,13 +74,14 @@ def psnr(a, b):
 def make_dream_video(model, take, stats, vae, out_path: Path, fps, seconds=10, start=None,
                      device=torch.device("cpu"), dtype=torch.float32, steps=3, amp="fp16"):
     t_len = len(take["lat"])
-    horizon = min(int(seconds * fps), t_len - wm.CONTEXT - 1)
+    c = model.context
+    horizon = min(int(seconds * fps), t_len - c - 1)
     if horizon < 1:
         return None
     if start is None:
-        start = random.randint(0, t_len - wm.CONTEXT - horizon)
+        start = random.randint(0, t_len - c - horizon)
     dream = rollout(model, take, start, horizon, device, steps, amp)
-    real = torch.from_numpy(take["lat"][start + wm.CONTEXT:start + wm.CONTEXT + horizon]).to(device)
+    real = torch.from_numpy(take["lat"][start + c:start + c + horizon]).to(device)
     dream_img = decode(vae, dream, stats, dtype)
     real_img = decode(vae, real, stats, dtype)
 
@@ -125,10 +134,10 @@ def main():
     fps = index["fps"]
     for c in range(args.clips):
         take = random.choice(data.takes)
-        horizon = min(int(args.seconds * fps), len(take["lat"]) - wm.CONTEXT - 1)
+        horizon = min(int(args.seconds * fps), len(take["lat"]) - model.context - 1)
         if horizon < 1:
             continue
-        start = random.randint(0, len(take["lat"]) - wm.CONTEXT - horizon)
+        start = random.randint(0, len(take["lat"]) - model.context - horizon)
         for steps in steps_list:
             tag = f"_{steps}steps" if len(steps_list) > 1 else ""
             path = out / f"dream_step{ck['step']}_{c + 1}{tag}.mp4"

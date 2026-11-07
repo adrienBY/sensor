@@ -48,10 +48,13 @@ def worker(amp, batch, seconds, warmup):
 
     try:
         torch.manual_seed(0)
-        model = wm.WorldDiT(LATENT).to(dev)
+        model = wm.WorldDiT(LATENT, context=wm.NEW_CONTEXT, mem_k=wm.NEW_MEM_K).to(dev)
         opt, opt_kind = make_optimizer(model, 1e-4)
         scaler = torch.amp.GradScaler(dev.type, enabled=(amp == "fp16" and dev.type == "cuda"))
-        ctx = torch.randn(batch, wm.CONTEXT, *LATENT, device=dev)
+        ctx = torch.randn(batch, wm.NEW_CONTEXT, *LATENT, device=dev)
+        mem = torch.randn(batch, wm.NEW_MEM_K, *LATENT, device=dev)
+        mem_pose = torch.rand(batch, wm.NEW_MEM_K, wm.POSE_DIM, device=dev)
+        mem_pose[..., -1] = 1.0
         tgt = torch.randn(batch, *LATENT, device=dev)
         act = torch.randn(batch, wm.ACTION_DIM, device=dev)
         ev = torch.zeros(batch, dtype=torch.long, device=dev)
@@ -59,7 +62,7 @@ def worker(amp, batch, seconds, warmup):
 
         def one_step():
             with wm.autocast(dev, amp):
-                loss = wm.training_loss(model, ctx, tgt, act, ev)
+                loss = wm.training_loss(model, ctx, tgt, act, ev, mem, mem_pose)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)

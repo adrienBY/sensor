@@ -15,12 +15,20 @@ Tuned for AMD RDNA 4 (RX 9070) following AMD's ROCm guidance:
   * model sizes are multiples of 64 so matrix multiplies map onto the WMMA units;
   * TunableOp (AMD's GEMM auto-tuner) is switched on through environment variables by the
     launcher when bench.py finds it faster on this GPU.
+
+New models (version 2) also get:
+  * memory: frames of the take that saw the same place, retrieved by camera pose;
+  * an 8-frame context instead of 4;
+  * self-forcing rollouts: after a warm-up, part of each batch continues from frames the model
+    generated itself, so it learns to correct its own blur instead of compounding it.
+Older checkpoints keep training with the architecture they were made with.
 """
 import argparse
 import copy
 import json
 import math
 import os
+import random
 import signal
 import time
 from pathlib import Path
@@ -56,6 +64,14 @@ def main():
     ap.add_argument("--dream-every", type=float, default=20, help="minutes between dream videos")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-dreams", action="store_true", help="skip dream videos (testing)")
+    ap.add_argument("--context", type=int, default=wm.NEW_CONTEXT, help="past frames (new models)")
+    ap.add_argument("--memory", type=int, default=wm.NEW_MEM_K,
+                    help="memory frames per prediction (new models; 0 = no memory)")
+    ap.add_argument("--rollout-start", type=int, default=5000,
+                    help="step at which self-forcing rollouts begin")
+    ap.add_argument("--rollout-full", type=int, default=20000,
+                    help="step at which rollouts reach their full share (half of the steps)")
+    ap.add_argument("--no-rollout", action="store_true")
     ap.add_argument("--dream-steps", type=int, default=3, help="denoising steps in dream videos")
     args = ap.parse_args()
 
@@ -84,11 +100,9 @@ def main():
         val = train
     print(f"Training on {len(train)} takes, {train.frames()} frames "
           f"({train.frames() / fps / 60:.1f} min); dreams from {len(val)} takes")
-    train.to_device(device)
 
     if ck:
-        cfg = dict(ck["config"])
-        model = wm.WorldDiT(tuple(cfg.pop("latent_shape")), **cfg).to(device)
+        model = wm.build_model(ck["config"]).to(device)
         model.load_state_dict(wm.upgrade_state_dict(ck["model"]))
         if tuple(model.config["latent_shape"]) != tuple(train.latent_shape):
             raise SystemExit("Latent size changed since the last run; start a new run folder.")
@@ -96,7 +110,14 @@ def main():
         if args.dim % 64:
             raise SystemExit("--dim must be a multiple of 64 (WMMA-friendly matrix sizes)")
         model = wm.WorldDiT(train.latent_shape, dim=args.dim, depth=args.depth,
-                            heads=args.dim // 64).to(device)
+                            heads=args.dim // 64, context=args.context,
+                            mem_k=args.memory).to(device)
+    rollout = 0 if args.no_rollout else wm.ROLLOUT
+    t_dev = time.time()
+    train.to_device(device, model.context, rollout, model.mem_k)
+    print(f"context {model.context} frames · memory {model.mem_k} frames per prediction · "
+          f"self-forcing rollouts {'off' if not rollout else f'from step {args.rollout_start}'}"
+          f" · data on GPU in {time.time() - t_dev:.1f} s")
     ema = copy.deepcopy(model).eval()
     if ck:
         ema.load_state_dict(wm.upgrade_state_dict(ck["ema"]))
@@ -187,9 +208,30 @@ def main():
         if step < 1000:                                   # warm-up
             for g in opt.param_groups:
                 g["lr"] = lr * (step + 1) / 1000
-        ctx, tgt, act, ev = train.gpu_batch(args.batch)
+        b = train.gpu_batch(args.batch)
+        C, R = model.context, rollout
+        win, acts, evs = b["win"], b["act"], b["ev"]
+        mem, mem_pose = b.get("mem"), b.get("mem_pose")
+        ctx, tgt = win[:, R:R + C], win[:, R + C]
+        act, ev = acts[:, R + C - 1], evs[:, R + C - 1]
+        # Self-forcing: a quarter of the batch replaces its last k context frames with frames
+        # the model generates itself (2 quick denoising steps each, no gradient), so it learns
+        # to predict the real next frame from its own imperfect output.
+        p_roll = 0.0 if not R else min(0.5, max(0.0, 0.5 * (step - args.rollout_start)
+                                                / max(1, args.rollout_full - args.rollout_start)))
+        if p_roll > 0 and random.random() < p_roll:
+            nb, k = max(1, args.batch // 4), random.randint(1, R)
+            sub = (lambda x: None if x is None else x[:nb])
+            with wm.autocast(device, args.amp):
+                c = win[:nb, R - k:R - k + C]
+                for j in range(k):
+                    m = R - k + C + j                        # frame being generated
+                    z = wm.sample_next(model, c, acts[:nb, m - 1], evs[:nb, m - 1], steps=2,
+                                       mem=sub(mem), mem_pose=sub(mem_pose))
+                    c = torch.cat([c[:, 1:], z[:, None].float()], dim=1)
+            ctx = torch.cat([c, ctx[nb:]], dim=0)
         with wm.autocast(device, args.amp):
-            loss = wm.training_loss(fwd_model, ctx, tgt, act, ev)
+            loss = wm.training_loss(fwd_model, ctx, tgt, act, ev, mem, mem_pose)
         opt.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
