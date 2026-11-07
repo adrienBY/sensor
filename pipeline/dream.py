@@ -104,7 +104,9 @@ def main():
     ap.add_argument("checkpoint", type=Path)
     ap.add_argument("--seconds", type=float, default=10)
     ap.add_argument("--clips", type=int, default=3)
-    ap.add_argument("--steps", type=int, default=3, help="denoising steps per frame")
+    ap.add_argument("--steps", default="3",
+                    help="denoising steps per frame; a list like 3,10 renders each clip once "
+                         "per value from the same starting point, to compare")
     ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -119,12 +121,21 @@ def main():
         data = wm.Dataset(args.processed, stats=ck["stats"])
     vae = load_vae(device, dtype)
     out = args.out or args.checkpoint.parent / "dreams"
+    steps_list = [int(x) for x in str(args.steps).split(",") if x.strip()]
+    fps = index["fps"]
     for c in range(args.clips):
         take = random.choice(data.takes)
-        path = out / f"dream_step{ck['step']}_{c + 1}.mp4"
-        m = make_dream_video(model, take, ck["stats"], vae, path, index["fps"], args.seconds,
-                             device=device, dtype=dtype, steps=args.steps, amp=args.amp)
-        print(f"{path.name}: {m}")
+        horizon = min(int(args.seconds * fps), len(take["lat"]) - wm.CONTEXT - 1)
+        if horizon < 1:
+            continue
+        start = random.randint(0, len(take["lat"]) - wm.CONTEXT - horizon)
+        for steps in steps_list:
+            tag = f"_{steps}steps" if len(steps_list) > 1 else ""
+            path = out / f"dream_step{ck['step']}_{c + 1}{tag}.mp4"
+            m = make_dream_video(model, take, ck["stats"], vae, path, fps, args.seconds,
+                                 start=start, device=device, dtype=dtype, steps=steps,
+                                 amp=args.amp)
+            print(f"{path.name}: {m}")
 
 
 if __name__ == "__main__":

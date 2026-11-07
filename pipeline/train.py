@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--dream-every", type=float, default=20, help="minutes between dream videos")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-dreams", action="store_true", help="skip dream videos (testing)")
+    ap.add_argument("--dream-steps", type=int, default=3, help="denoising steps in dream videos")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -174,7 +175,7 @@ def main():
         path = args.run / "dreams" / f"step{step:07d}.mp4"
         m = make_dream_video(ema, take, stats, vae, path, fps, 10, device=device,
                              dtype=torch.float16 if device.type == "cuda" else torch.float32,
-                             amp=args.amp)
+                             steps=args.dream_steps, amp=args.amp)
         if m:
             m.update({"step": step, "minutes": round(minutes_total(), 1)})
             with open(metrics_path, "a") as f:

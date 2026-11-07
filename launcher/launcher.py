@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 5
+LAUNCHER_VERSION = 6
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -36,7 +36,7 @@ ROCM_SDK = [
 TORCH = [ROCM + "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"]
 EXTRA = ["numpy", "opencv-python", "diffusers", "safetensors", "accelerate"]
 DEFAULT_SETTINGS = {"train_minutes": 60, "fps": 15, "width": 256, "height": 144,
-                    "amp": "fp16", "batch": 64, "tunableop": False}
+                    "amp": "fp16", "batch": 64, "tunableop": False, "dream_steps": 3}
 
 FROZEN = getattr(sys, "frozen", False)
 BUNDLE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
@@ -304,7 +304,7 @@ def train(py, s, minutes=None):
     s = tune(py, s)
     ok = step(py, f"Training the world model for {minutes} minutes (Ctrl+C stops and saves)",
               "train.py", PROCESSED, RUN, "--minutes", minutes, "--amp", s["amp"],
-              "--batch", s["batch"], env=env_for(s))
+              "--batch", s["batch"], "--dream-steps", s["dream_steps"], env=env_for(s))
     if ok and (RUN / "dreams").exists():
         say(f"\nDream videos: {RUN / 'dreams'}")
         open_folder(RUN / "dreams")
@@ -409,10 +409,12 @@ def menu(py, s):
                 continue
             if choice == "4":
                 step(py, "Walking in the dream: the window opens shortly", "play.py",
-                     PROCESSED, RUN / "last.pt", "--amp", s["amp"], env=env_for(s))
+                     PROCESSED, RUN / "last.pt", "--amp", s["amp"], "--steps", s["dream_steps"],
+                     env=env_for(s))
             else:
-                if step(py, "Making dream videos", "dream.py", PROCESSED, RUN / "last.pt",
-                        "--amp", s["amp"], env=env_for(s)):
+                if step(py, "Making dream videos: each clip with 3 and 10 denoising steps to "
+                        "compare", "dream.py", PROCESSED, RUN / "last.pt", "--amp", s["amp"],
+                        "--steps", "3,10", env=env_for(s)):
                     open_folder(RUN / "dreams")
         elif choice == "6":
             open_folder(HOME)
