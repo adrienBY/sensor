@@ -27,6 +27,7 @@ import cv2
 import numpy as np
 import torch
 
+import fsr
 import worldmodel as wm
 from dream import decode, load_vae
 
@@ -70,7 +71,11 @@ def main():
     ap.add_argument("processed", type=Path)
     ap.add_argument("checkpoint", type=Path)
     ap.add_argument("--steps", type=int, default=3, help="denoising steps (fewer = faster)")
-    ap.add_argument("--scale", type=int, default=3, help="window size multiplier (3 = like the videos)")
+    ap.add_argument("--scale", type=int, default=3, help="window size multiplier with --upscale linear")
+    ap.add_argument("--upscale", choices=["fsr", "linear"], default="fsr",
+                    help="fsr = AMD FSR 1 (EASU + RCAS) to 1280x720; linear = plain stretching")
+    ap.add_argument("--sharpness", type=float, default=0.25,
+                    help="FSR 1 RCAS sharpening in stops: 0 = strongest, 2 = mild")
     ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -88,6 +93,7 @@ def main():
     c = model.context
     fps = json.loads((args.processed / "index.json").read_text()).get("fps", 15)
     step_m, turn, look = footage_speeds(data)
+    print(f"Display: {'AMD FSR 1 upscaling to 1280x720' if args.upscale == 'fsr' else f'{args.scale}x linear'}")
     print(f"Matching the dream videos: {args.steps} denoising steps, {fps} frames per second, "
           f"walk {step_m * fps:.2f} m/s, turn {np.degrees(turn) * fps:.0f} deg/s, "
           f"look {np.degrees(look) * fps:.0f} deg/s (from your footage)")
@@ -156,7 +162,10 @@ def main():
         ctx = torch.cat([ctx[:, 1:], z[:, None].float()], dim=1)
         img = decode(vae, z, ck["stats"], dtype)[0]
         h, w = img.shape[:2]
-        big = cv2.resize(img, (w * args.scale, h * args.scale), interpolation=cv2.INTER_LINEAR)
+        if args.upscale == "fsr":
+            big = fsr.upscale(img, 1280, 720, device=device, sharpness=args.sharpness)
+        else:
+            big = cv2.resize(img, (w * args.scale, h * args.scale), interpolation=cv2.INTER_LINEAR)
         frames += 1
         if time.time() - fps_t >= 1:
             fps_text = f"{frames / (time.time() - fps_t):.1f} fps"
