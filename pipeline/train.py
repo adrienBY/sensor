@@ -72,6 +72,8 @@ def main():
     ap.add_argument("--rollout-full", type=int, default=20000,
                     help="step at which rollouts reach their full share (half of the steps)")
     ap.add_argument("--no-rollout", action="store_true")
+    ap.add_argument("--min-takes-for-val", type=int, default=10,
+                    help="below this many takes, validation takes are trained on too")
     ap.add_argument("--dream-steps", type=int, default=3, help="denoising steps in dream videos")
     args = ap.parse_args()
 
@@ -89,7 +91,11 @@ def main():
 
     ck = torch.load(ckpt_path, map_location=device, weights_only=False) if ckpt_path.exists() else None
     stats = ck["stats"] if ck else None
-    train = wm.Dataset(args.processed, split="train", stats=stats)
+    # Hold takes back for testing only once there are plenty: with a handful of takes, every
+    # take is worth more as training data (dream videos then replay training footage).
+    n_takes = sum(1 for e in index["takes"] if (args.processed / e["take"] / "latents.npy").exists())
+    split = "train" if n_takes >= args.min_takes_for_val else None
+    train = wm.Dataset(args.processed, split=split, stats=stats)
     if len(train) == 0:
         train = wm.Dataset(args.processed, stats=stats)          # very first takes: no split yet
     if len(train) == 0:
