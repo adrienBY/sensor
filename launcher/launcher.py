@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 3
+LAUNCHER_VERSION = 4
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -381,6 +381,26 @@ def menu(py, s):
 _LOCK = None
 
 
+def windows_unattended():
+    """Let training run with nobody at the PC: no idle sleep while this window is open (the
+    screen may still turn off), and no QuickEdit, where a stray click into the console
+    window pauses the program until a key is pressed."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        k32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        handle = k32.GetStdHandle(-10)                      # console input
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(handle, ctypes.byref(mode)):
+            ENABLE_QUICK_EDIT, ENABLE_EXTENDED_FLAGS = 0x0040, 0x0080
+            k32.SetConsoleMode(handle, (mode.value & ~ENABLE_QUICK_EDIT) | ENABLE_EXTENDED_FLAGS)
+    except Exception:
+        pass
+
+
 def single_instance():
     """Only one WorldModel window per folder: two at once corrupt the setup and the data."""
     global _LOCK
@@ -409,6 +429,7 @@ def main():
         except EOFError:
             pass
         return
+    windows_unattended()
     LOGS.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(LOGS / f"{datetime.datetime.now():%Y%m%d-%H%M%S}.log", "w", encoding="utf-8")
     try:
