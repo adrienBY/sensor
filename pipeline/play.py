@@ -9,6 +9,11 @@ Starts from real frames of one of your takes, then every frame comes from the wo
   1-9     trigger an interaction tag (listed at start)
   R       restart from a new real moment      Q or Esc   quit
 Walking (W/S/A/D) only means something if the model was trained on AR-mode takes.
+
+It runs with the same settings as the dream videos: the same model copy (EMA), denoising
+steps, context noise and memory, one frame per 1/15 s (the footage's frame rate), and walking
+and turning speeds measured from your own footage, so each key press is a movement the model
+has actually seen. On Windows several keys can be held at once (walk and turn together).
 """
 import argparse
 import random
@@ -22,9 +27,39 @@ import torch
 import worldmodel as wm
 from dream import decode, load_vae
 
-STEP_M = 0.035     # metres per frame when walking (~0.5 m/s at 15 fps)
-TURN = 0.045       # radians per frame
-LOOK = 0.03
+import json
+import os
+
+
+def footage_speeds(data):
+    """Typical per-frame walking, turning and looking speeds while you were actually moving,
+    measured from the takes, so key presses match the motion the model learned from."""
+    act = np.concatenate([t["act"] for t in data.takes])
+    rot, trans, has = act[:, :3] / wm.ROT_SCALE, act[:, 3:6] / wm.TRANS_SCALE, act[:, 6] > 0
+    def typical(x, lo, hi, pct, default):
+        x = np.abs(x)
+        x = x[x > lo]                       # only frames where you were deliberately moving
+        return float(np.clip(np.percentile(x, pct), lo, hi)) if len(x) > 50 else default
+    step = typical(np.linalg.norm(trans[has], axis=1), 0.01, 0.08, 60, 0.035)
+    turn = typical(rot[:, 1], 0.015, 0.12, 80, 0.045)
+    look = typical(rot[:, 0], 0.01, 0.08, 80, 0.03)
+    return step, turn, look
+
+
+HOLD_KEYS = "WASDJLIK"
+
+
+def held_keys():
+    """Letters held down right now (Windows), so keys combine and movement is continuous like
+    real footage instead of stuttering with keyboard auto-repeat. None elsewhere."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        get = ctypes.windll.user32.GetAsyncKeyState
+        return {k.lower() for k in HOLD_KEYS if get(ord(k)) & 0x8000}
+    except Exception:
+        return None
 
 
 def main():
@@ -48,6 +83,11 @@ def main():
         print(f"  {i + 1}: {v}")
 
     c = model.context
+    fps = json.loads((args.processed / "index.json").read_text()).get("fps", 15)
+    step_m, turn, look = footage_speeds(data)
+    print(f"Matching the dream videos: {args.steps} denoising steps, {fps} frames per second, "
+          f"walk {step_m * fps:.2f} m/s, turn {np.degrees(turn) * fps:.0f} deg/s, "
+          f"look {np.degrees(look) * fps:.0f} deg/s (from your footage)")
     state = {}
 
     def reset():
@@ -66,19 +106,22 @@ def main():
     key = -1
     fps_t, frames = time.time(), 0
     fps_text = ""
+    frame_t = time.time()
     while True:
         rot = np.zeros(3, np.float32)
         trans = np.zeros(3, np.float32)
         event = 0
         k = chr(key).lower() if 0 <= key < 256 else ""
-        if k == "w": trans[2] = -STEP_M
-        if k == "s": trans[2] = STEP_M
-        if k == "a": trans[0] = -STEP_M
-        if k == "d": trans[0] = STEP_M
-        if k == "j": rot[1] = TURN
-        if k == "l": rot[1] = -TURN
-        if k == "i": rot[0] = LOOK
-        if k == "k": rot[0] = -LOOK
+        held = held_keys()
+        down = held if held is not None else {k}
+        if "w" in down: trans[2] -= step_m
+        if "s" in down: trans[2] += step_m
+        if "a" in down: trans[0] -= step_m
+        if "d" in down: trans[0] += step_m
+        if "j" in down: rot[1] += turn
+        if "l" in down: rot[1] -= turn
+        if "i" in down: rot[0] += look
+        if "k" in down: rot[0] -= look
         if k.isdigit() and k != "0" and int(k) <= len(vocab):
             event = int(k)
         if k == "r":
@@ -106,7 +149,10 @@ def main():
         bgr = cv2.cvtColor(big, cv2.COLOR_RGB2BGR)
         cv2.putText(bgr, fps_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         cv2.imshow(win, bgr)
-        key = cv2.waitKey(1)
+        # one frame per 1/fps like the footage; if the GPU is slower, the dream just runs slower
+        wait_ms = max(1, int((frame_t + 1 / fps - time.time()) * 1000))
+        key = cv2.waitKey(wait_ms)
+        frame_t = max(time.time(), frame_t + 1 / fps) if wait_ms > 1 else time.time()
         if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
             break
     cv2.destroyAllWindows()
