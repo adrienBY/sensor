@@ -180,6 +180,7 @@ def main():
     last_save = last_dream = t0
     log_t = t0
     log_loss = torch.zeros((), device=device)   # summed on the GPU, read every 30 s
+    log_bad = torch.zeros((), device=device)    # steps whose loss was not finite (skipped)
     log_n = 0
     metrics_path = args.run / "metrics.jsonl"
 
@@ -247,20 +248,25 @@ def main():
         with torch.no_grad():
             torch._foreach_lerp_(ema_params, model_params, 1 - 0.999)
         step += 1
-        log_loss += loss.detach()
+        finite = torch.isfinite(loss.detach())
+        log_loss += torch.where(finite, loss.detach(), torch.zeros_like(loss.detach()))
+        log_bad += (~finite).float()
         log_n += 1
 
         now = time.time()
         if now - log_t >= 30:
             # Read the loss (this waits for the GPU to finish the queued steps) BEFORE taking
             # the time, so each window is charged for its own GPU work, not the previous one's.
-            loss_avg = log_loss.item() / log_n
+            bad = int(log_bad.item())
+            loss_avg = log_loss.item() / max(1, log_n - bad)
             now = time.time()
             print(f"step {step:7d}  loss {loss_avg:.4f}  "
                   f"{log_n / (now - log_t):6.1f} steps/s  "
                   f"{log_n * args.batch / (now - log_t):7.0f} samples/s  "
-                  f"{(args.minutes * 60 - (now - t0)) / 60:5.1f} min left", flush=True)
+                  f"{(args.minutes * 60 - (now - t0)) / 60:5.1f} min left"
+                  + (f"  ({bad} steps skipped: loss not finite)" if bad else ""), flush=True)
             log_loss.zero_()
+            log_bad.zero_()
             log_n, log_t = 0, now
         if now - last_save >= args.save_every * 60:
             save()

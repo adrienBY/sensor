@@ -32,6 +32,8 @@ MEM_DROPOUT = 0.1    # training: share of samples with no memory, so the model w
 ROLLOUT = 3          # training: up to this many context frames come from the model itself
 POSE_DIM = 8         # relative rotation xyz, relative position xyz, has_position, valid
 ACTION_DIM = 7       # rot xyz, trans xyz, has_trans
+MAX_ROT_STEP = 0.6   # rad per frame (~500 deg/s at 15 fps): faster turns are tracking glitches
+MAX_TRANS_STEP = 0.5 # m per frame (7.5 m/s): longer jumps are tracking glitches
 ROT_SCALE = 10.0     # bring per-step radians / metres to roughly unit range
 TRANS_SCALE = 10.0
 SIGMA_DATA = 1.0     # latents are normalised to unit variance
@@ -165,6 +167,19 @@ def action_vector(rot, trans, has_trans):
     ], axis=-1)
 
 
+def clean_actions(rot, trans, has_trans):
+    """Cap physically impossible per-frame jumps (ARCore relocalisation glitches). A single
+    1.8 rad step was enough to overflow FP16 inside the network and turn the loss to NaN."""
+    rot = np.asarray(rot, np.float64).copy()
+    trans = np.asarray(trans, np.float64)
+    has = np.asarray(has_trans, bool).copy()
+    rn = np.linalg.norm(rot, axis=1)
+    big = rn > MAX_ROT_STEP
+    rot[big] *= (MAX_ROT_STEP / rn[big])[:, None]
+    has[np.linalg.norm(trans, axis=1) > MAX_TRANS_STEP] = False      # movement unknown there
+    return rot, np.where(has[:, None], trans, 0.0), has
+
+
 class Dataset:
     """All encoded takes of one split, held in RAM (an hour of footage is ~250 MB)."""
 
@@ -182,13 +197,13 @@ class Dataset:
             if len(lat) < CONTEXT + 2:
                 continue
             a = np.load(d / "actions.npz")
-            has = a["has_trans"].astype(bool)
-            r, p = integrate_poses(a["rot"], a["trans"] * has[:, None])
+            rot, trans, has = clean_actions(a["rot"], a["trans"], a["has_trans"])
+            r, p = integrate_poses(rot, trans * has[:, None])
             self.takes.append({
                 "name": e["take"],
                 "dir": d,
                 "lat": lat,
-                "act": action_vector(a["rot"], a["trans"], a["has_trans"]),
+                "act": action_vector(rot, trans, has),
                 "ev": a["event"].astype(np.int64),
                 "R": r, "p": p, "has": bool(has.any()),
             })
