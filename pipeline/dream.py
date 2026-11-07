@@ -40,7 +40,25 @@ def decode(vae, z_norm, stats, dtype, chunk=32):
 
 
 @torch.no_grad()
-def rollout(model, take, start, horizon, device, steps=3, amp="fp16"):
+def find_revisit_start(take, context, horizon):
+    """A clip where the camera turns away (more than 70 degrees) and comes back to within
+    25 degrees of where it started: the test of whether the dream remembers.
+    Returns (start, score) or None."""
+    f = -take["R"][:, :, 2]
+    n = len(f)
+    best = None
+    for s in range(0, n - context - horizon - 1, 5):
+        a, b = s + context, s + context + horizon - 1
+        back = float(f[a] @ f[b])
+        away = float((f[a + 1:b] @ f[a]).min())
+        if back > 0.9 and away < 0.35:
+            score = back - away
+            if best is None or score > best[1]:
+                best = (s, score)
+    return best
+
+
+def rollout(model, take, start, horizon, device, steps=3, amp="fp16", guidance=1.0):
     lat, act, ev = take["lat"], take["act"], take["ev"]
     c = model.context
     ctx = torch.from_numpy(lat[start:start + c])[None].to(device)
@@ -55,7 +73,8 @@ def rollout(model, take, start, horizon, device, steps=3, amp="fp16"):
             mem, mem_pose = wm.memory_for(take, take["R"][k + 1], take["p"][k + 1],
                                           model.mem_k, device, exclude)
         with wm.autocast(device, amp):
-            z = wm.sample_next(model, ctx, a, e, steps=steps, mem=mem, mem_pose=mem_pose)
+            z = wm.sample_next(model, ctx, a, e, steps=steps, mem=mem, mem_pose=mem_pose,
+                               guidance=guidance)
         dreams.append(z.float())
         ctx = torch.cat([ctx[:, 1:], z[:, None].to(ctx.dtype)], dim=1)
     return torch.cat(dreams)
@@ -72,7 +91,8 @@ def psnr(a, b):
 
 
 def make_dream_video(model, take, stats, vae, out_path: Path, fps, seconds=10, start=None,
-                     device=torch.device("cpu"), dtype=torch.float32, steps=3, amp="fp16"):
+                     device=torch.device("cpu"), dtype=torch.float32, steps=3, amp="fp16",
+                     guidance=1.0):
     t_len = len(take["lat"])
     c = model.context
     horizon = min(int(seconds * fps), t_len - c - 1)
@@ -80,7 +100,7 @@ def make_dream_video(model, take, stats, vae, out_path: Path, fps, seconds=10, s
         return None
     if start is None:
         start = random.randint(0, t_len - c - horizon)
-    dream = rollout(model, take, start, horizon, device, steps, amp)
+    dream = rollout(model, take, start, horizon, device, steps, amp, guidance)
     real = torch.from_numpy(take["lat"][start + c:start + c + horizon]).to(device)
     dream_img = decode(vae, dream, stats, dtype)
     real_img = decode(vae, real, stats, dtype)
@@ -117,6 +137,8 @@ def main():
                     help="denoising steps per frame; a list like 3,10 renders each clip once "
                          "per value from the same starting point, to compare")
     ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
+    ap.add_argument("--guidance", type=float, default=1.0,
+                    help="action guidance (1 = off, 1.5-2 follows the camera moves more firmly)")
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -143,7 +165,7 @@ def main():
             path = out / f"dream_step{ck['step']}_{c + 1}{tag}.mp4"
             m = make_dream_video(model, take, ck["stats"], vae, path, fps, args.seconds,
                                  start=start, device=device, dtype=dtype, steps=steps,
-                                 amp=args.amp)
+                                 amp=args.amp, guidance=args.guidance)
             print(f"{path.name}: {m}")
 
 

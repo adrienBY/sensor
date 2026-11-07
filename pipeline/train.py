@@ -22,6 +22,15 @@ New models (version 2) also get:
   * self-forcing rollouts: after a warm-up, part of each batch continues from frames the model
     generated itself, so it learns to correct its own blur instead of compounding it.
 Older checkpoints keep training with the architecture they were made with.
+
+Version 2.1 tricks (work on existing checkpoints too):
+  * the learning rate decays to near zero over the last 15% of every run (warmup-stable-decay),
+    and ramps back up over 500 steps when a run resumes;
+  * training windows are sampled by importance: interaction moments x4, fast turns x2,
+    blurry targets x0.3;
+  * mirror augmentation: half the samples are flipped left-right with mirrored actions;
+  * action dropout: 10% of samples hide the action, which enables action guidance in play;
+  * dream videos always use the same clips, including one that turns away and comes back.
 """
 import argparse
 import copy
@@ -36,6 +45,36 @@ from pathlib import Path
 import torch
 
 import worldmodel as wm
+
+
+def eval_clips(run, data, context, fps, seconds=10):
+    """Pick the dream-video clips once per run folder and keep them in eval_clips.json:
+    'fixed' (a seeded random moment) and 'revisit' (the camera turns away and comes back)."""
+    path = run / "eval_clips.json"
+    names = {t["name"] for t in data.takes}
+    if path.exists():
+        clips = json.loads(path.read_text())
+        if clips and all(c["take"] in names for c in clips):
+            return clips
+    from dream import find_revisit_start
+    horizon = int(seconds * fps)
+    rng = random.Random(1234)
+    usable = [t for t in data.takes if len(t["lat"]) > context + horizon + 1]
+    clips = []
+    if usable:
+        t = rng.choice(usable)
+        clips.append({"name": "fixed", "take": t["name"],
+                      "start": rng.randint(0, len(t["lat"]) - context - horizon - 1)})
+        best = None
+        for t in usable:
+            r = find_revisit_start(t, context, horizon)
+            if r and (best is None or r[1] > best[1]):
+                best = (t["name"], r[1], r[0])
+        if best:
+            clips.append({"name": "revisit", "take": best[0], "start": best[2]})
+    path.write_text(json.dumps(clips, indent=2))
+    print("Dream clips: " + ", ".join(f"{c['name']} ({c['take'][-30:]} @ {c['start']})" for c in clips))
+    return clips
 
 
 def make_optimizer(model, lr):
@@ -72,6 +111,12 @@ def main():
     ap.add_argument("--rollout-full", type=int, default=20000,
                     help="step at which rollouts reach their full share (half of the steps)")
     ap.add_argument("--no-rollout", action="store_true")
+    ap.add_argument("--no-mirror", action="store_true", help="no left-right flip augmentation")
+    ap.add_argument("--no-weighting", action="store_true", help="sample all windows equally")
+    ap.add_argument("--action-dropout", type=float, default=0.1,
+                    help="share of samples trained without their action (enables guidance)")
+    ap.add_argument("--decay", type=float, default=0.15,
+                    help="final share of each run over which the learning rate decays")
     ap.add_argument("--min-takes-for-val", type=int, default=10,
                     help="below this many takes, validation takes are trained on too")
     ap.add_argument("--dream-steps", type=int, default=3, help="denoising steps in dream videos")
@@ -120,10 +165,14 @@ def main():
                             mem_k=args.memory).to(device)
     rollout = 0 if args.no_rollout else wm.ROLLOUT
     t_dev = time.time()
-    train.to_device(device, model.context, rollout, model.mem_k)
+    train.to_device(device, model.context, rollout, model.mem_k,
+                    weighted=not args.no_weighting, mirror=not args.no_mirror)
     print(f"context {model.context} frames · memory {model.mem_k} frames per prediction · "
           f"self-forcing rollouts {'off' if not rollout else f'from step {args.rollout_start}'}"
           f" · data on GPU in {time.time() - t_dev:.1f} s")
+    print(f"mirror {'off' if args.no_mirror else 'on'} · importance sampling "
+          f"{'off' if args.no_weighting else 'on (%.0f%% of samples boosted)' % (100 * train.weight_stats['boosted_share'])}"
+          f" · action dropout {args.action_dropout:.0%} · LR decay over the last {args.decay:.0%}")
     ema = copy.deepcopy(model).eval()
     if ck:
         ema.load_state_dict(wm.upgrade_state_dict(ck["ema"]))
@@ -146,6 +195,7 @@ def main():
             print("Optimizer state does not match (settings changed); starting it fresh.")
     scaler = torch.amp.GradScaler(device.type, enabled=(args.amp == "fp16" and device.type == "cuda"))
     step = ck["step"] if ck else 0
+    start_step = step
     minutes_before = ck.get("minutes_trained", 0.0) if ck else 0.0
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model: {n_params:.1f}M parameters, optimizer {opt_kind}, lr {lr:.2e}, "
@@ -196,31 +246,51 @@ def main():
             except Exception:
                 pass
 
-    def dream():
-        if vae is None:
-            return
-        take = val.takes[step % len(val.takes)]
-        path = args.run / "dreams" / f"step{step:07d}.mp4"
-        m = make_dream_video(ema, take, stats, vae, path, fps, 10, device=device,
-                             dtype=torch.float16 if device.type == "cuda" else torch.float32,
-                             steps=args.dream_steps, amp=args.amp)
-        if m:
-            m.update({"step": step, "minutes": round(minutes_total(), 1)})
-            with open(metrics_path, "a") as f:
-                f.write(json.dumps(m) + "\n")
-            print(f"  dream video {path.name}: " +
-                  ", ".join(f"{k} {v}" for k, v in m.items() if k.startswith("psnr")))
+    clips = eval_clips(args.run, val, model.context, fps) if vae is not None else []
 
-    while not stop["now"] and time.time() - t0 < args.minutes * 60:
-        if step < 1000:                                   # warm-up
-            for g in opt.param_groups:
-                g["lr"] = lr * (step + 1) / 1000
+    def dream():
+        """The same clips every time (saved in eval_clips.json), so numbers compare across
+        videos: a random-but-fixed clip, and a clip that turns away and comes back."""
+        for clip in clips:
+            take = next((t for t in val.takes if t["name"] == clip["take"]), None)
+            if take is None:
+                continue
+            path = args.run / "dreams" / f"step{step:07d}_{clip['name']}.mp4"
+            m = make_dream_video(ema, take, stats, vae, path, fps, 10, start=clip["start"],
+                                 device=device,
+                                 dtype=torch.float16 if device.type == "cuda" else torch.float32,
+                                 steps=args.dream_steps, amp=args.amp)
+            if m:
+                m.update({"step": step, "minutes": round(minutes_total(), 1), "clip": clip["name"]})
+                with open(metrics_path, "a") as f:
+                    f.write(json.dumps(m) + "\n")
+                print(f"  dream video {path.name}: " +
+                      ", ".join(f"{k} {v}" for k, v in m.items() if k.startswith("psnr")))
+
+    budget = args.minutes * 60
+    null_ev = wm.null_event(model)
+    while not stop["now"] and time.time() - t0 < budget:
+        # Learning rate: warm up on a fresh model (1,000 steps) or after resuming (500 steps,
+        # from 10%), hold, then decay to 2% over the last `decay` share of the run.
+        if start_step == 0:
+            f = min(1.0, (step + 1) / 1000)
+        else:
+            f = min(1.0, 0.1 + 0.9 * (step - start_step) / 500)
+        frac = (time.time() - t0) / budget
+        if args.decay > 0 and frac > 1 - args.decay:
+            f *= max(0.02, (1 - frac) / args.decay)
+        for g in opt.param_groups:
+            g["lr"] = lr * f
         b = train.gpu_batch(args.batch)
         C, R = model.context, rollout
         win, acts, evs = b["win"], b["act"], b["ev"]
         mem, mem_pose = b.get("mem"), b.get("mem_pose")
         ctx, tgt = win[:, R:R + C], win[:, R + C]
         act, ev = acts[:, R + C - 1], evs[:, R + C - 1]
+        if args.action_dropout > 0:                       # "action unknown" for guidance
+            drop = torch.rand(act.shape[0], device=act.device) < args.action_dropout
+            act = torch.where(drop[:, None], torch.zeros_like(act), act)
+            ev = torch.where(drop, torch.full_like(ev, null_ev), ev)
         # Self-forcing: a quarter of the batch replaces its last k context frames with frames
         # the model generates itself (2 quick denoising steps each, no gradient), so it learns
         # to predict the real next frame from its own imperfect output.

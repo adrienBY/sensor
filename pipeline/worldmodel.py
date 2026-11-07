@@ -34,6 +34,16 @@ POSE_DIM = 8         # relative rotation xyz, relative position xyz, has_positio
 ACTION_DIM = 7       # rot xyz, trans xyz, has_trans
 MAX_ROT_STEP = 0.6   # rad per frame (~500 deg/s at 15 fps): faster turns are tracking glitches
 MAX_TRANS_STEP = 0.5 # m per frame (7.5 m/s): longer jumps are tracking glitches
+# Sampling weights (v2.1): which training windows to show more or less often
+W_EVENT = 4.0        # the target step has an interaction tag
+W_FAST_TURN = 2.0    # the camera turns fast in the target step
+FAST_TURN = 0.15     # rad per frame (~130 deg/s at 15 fps)
+W_BLURRY = 0.3       # the target frame is much blurrier than the take's median
+BLURRY = 0.5         # "much blurrier": sharpness under this share of the median
+# Mirror augmentation: flipping left-right negates these action / memory-pose components
+# (rotation about Y and Z, movement along X; the camera looks along -Z with +X to the right).
+MIRROR_ACT = (1, -1, -1, -1, 1, 1, 1)
+MIRROR_POSE = (1, -1, -1, -1, 1, 1, 1, 1)
 ROT_SCALE = 10.0     # bring per-step radians / metres to roughly unit range
 TRANS_SCALE = 10.0
 SIGMA_DATA = 1.0     # latents are normalised to unit variance
@@ -199,6 +209,11 @@ class Dataset:
             a = np.load(d / "actions.npz")
             rot, trans, has = clean_actions(a["rot"], a["trans"], a["has_trans"])
             r, p = integrate_poses(rot, trans * has[:, None])
+            sharp = None
+            if (d / "sharpness.npy").exists():
+                sharp = np.load(d / "sharpness.npy").astype(np.float32)
+                if len(sharp) != len(lat):
+                    sharp = None
             self.takes.append({
                 "name": e["take"],
                 "dir": d,
@@ -206,6 +221,7 @@ class Dataset:
                 "act": action_vector(rot, trans, has),
                 "ev": a["event"].astype(np.int64),
                 "R": r, "p": p, "has": bool(has.any()),
+                "turn": np.linalg.norm(rot, axis=1), "sharp": sharp,
             })
         if not self.takes:
             return
@@ -227,13 +243,13 @@ class Dataset:
         return sum(len(t["lat"]) for t in self.takes)
 
     def to_device(self, device, context=NEW_CONTEXT, rollout=ROLLOUT, mem_k=0,
-                  candidates=MEM_CANDIDATES):
+                  candidates=MEM_CANDIDATES, weighted=True, mirror=False):
         """Move the whole split to the GPU once, so batches are built there with no CPU work
         or host-to-device copies per step (an hour of footage is ~125 MB in FP16). Each window
         holds rollout + context + 1 frames; with memory, the best memory candidates of every
         frame are precomputed."""
-        self.context, self.rollout, self.mem_k = context, rollout, mem_k
-        lat, act, ev, starts, mem_idx, mem_pose = [], [], [], [], [], []
+        self.context, self.rollout, self.mem_k, self.mirror = context, rollout, mem_k, mirror
+        lat, act, ev, starts, mem_idx, mem_pose, weights = [], [], [], [], [], [], []
         offset = 0
         for t in self.takes:
             n = len(t["lat"])
@@ -245,7 +261,16 @@ class Dataset:
             e[:n - 1] = t["ev"]
             ev.append(e)
             if n - context - rollout > 0:              # windows stay inside one take
-                starts.append(np.arange(offset, offset + n - context - rollout))
+                local = np.arange(n - context - rollout)
+                starts.append(local + offset)
+                w = np.ones(len(local))
+                if weighted:                           # the step / frame each window teaches
+                    step_i, frame_i = local + context + rollout - 1, local + context + rollout
+                    w[t["ev"][step_i] > 0] *= W_EVENT
+                    w[t["turn"][step_i] > FAST_TURN] *= W_FAST_TURN
+                    if t["sharp"] is not None:
+                        w[t["sharp"][frame_i] < BLURRY * np.median(t["sharp"])] *= W_BLURRY
+                weights.append(w)
             if mem_k:
                 idx, pose = memory_table(t["R"], t["p"], candidates, MEM_GAP, float(t["has"]))
                 mem_idx.append(np.where(idx >= 0, idx + offset, -1))
@@ -257,6 +282,10 @@ class Dataset:
         self.g_act = torch.from_numpy(np.concatenate(act)).to(device)
         self.g_ev = torch.from_numpy(np.concatenate(ev)).to(device)
         self.g_starts = torch.from_numpy(np.concatenate(starts)).to(device)
+        w = np.concatenate(weights)
+        self.g_weights = torch.from_numpy(w / w.sum()).float().to(device)
+        self.weight_stats = {"events": float((w >= W_EVENT).mean()),
+                             "boosted_share": float(w[w > 1].sum() / w.sum())}
         self.g_window = torch.arange(context + rollout + 1, device=device)
         self.g_steps = torch.arange(context + rollout, device=device)
         if mem_k:
@@ -269,7 +298,7 @@ class Dataset:
         win [n, R+C+1, ...] latents (the last one is the target), act / ev for each step of
         the window, and with memory: mem [n, K, ...] and mem_pose [n, K, POSE_DIM]."""
         dev = self.g_starts.device
-        s = self.g_starts[torch.randint(len(self.g_starts), (n,), device=dev)]
+        s = self.g_starts[torch.multinomial(self.g_weights, n, replacement=True)]
         steps = s[:, None] + self.g_steps
         out = {"win": self.g_lat[s[:, None] + self.g_window].float(),
                "act": self.g_act[steps], "ev": self.g_ev[steps]}
@@ -283,6 +312,17 @@ class Dataset:
             valid = (ci >= 0) & (torch.rand(n, 1, device=dev) >= MEM_DROPOUT)
             out["mem"] = self.g_lat[ci.clamp(min=0)].float() * valid[..., None, None, None]
             out["mem_pose"] = cp * valid[..., None]
+        if self.mirror:                                # flip half the samples left-right
+            flip = torch.rand(n, device=dev) < 0.5
+            f5 = flip[:, None, None, None, None]
+            out["win"] = torch.where(f5, out["win"].flip(-1), out["win"])
+            sa = torch.tensor(MIRROR_ACT, device=dev, dtype=out["act"].dtype)
+            out["act"] = torch.where(flip[:, None, None], out["act"] * sa, out["act"])
+            if self.mem_k:
+                out["mem"] = torch.where(f5, out["mem"].flip(-1), out["mem"])
+                sp = torch.tensor(MIRROR_POSE, device=dev, dtype=out["mem_pose"].dtype)
+                out["mem_pose"] = torch.where(flip[:, None, None], out["mem_pose"] * sp,
+                                              out["mem_pose"])
         return out
 
 
@@ -432,15 +472,28 @@ def training_loss(model, ctx, tgt, act, ev, mem=None, mem_pose=None):
     return F.mse_loss(pred.float(), target.float())
 
 
-def denoise(model, x, sigma, ctx, sigma_ctx, act, ev, mem=None, mem_pose=None):
+def null_event(model):
+    """The last tag slot is never a real tag: training uses it, with a zero action, to mean
+    "action unknown", which is what action guidance compares against."""
+    m = getattr(model, "model", model)
+    return m.event.num_embeddings - 1
+
+
+def denoise(model, x, sigma, ctx, sigma_ctx, act, ev, mem=None, mem_pose=None, guidance=1.0):
     c_skip, c_out, c_in, c_noise = precond(sigma)
-    return c_skip * x + c_out * model(c_in * x, ctx, c_noise, sigma_ctx, act, ev,
-                                      mem, mem_pose).float()
+    out = model(c_in * x, ctx, c_noise, sigma_ctx, act, ev, mem, mem_pose).float()
+    if guidance != 1.0:
+        # Action guidance: push the prediction away from "action unknown" towards "this action",
+        # so the dream follows the keys more firmly (classifier-free guidance on the action).
+        un = model(c_in * x, ctx, c_noise, sigma_ctx, torch.zeros_like(act),
+                   torch.full_like(ev, null_event(model)), mem, mem_pose).float()
+        out = un + guidance * (out - un)
+    return c_skip * x + c_out * out
 
 
 @torch.no_grad()
 def sample_next(model, ctx, act, ev, steps=3, ctx_noise=0.05, sigma_min=0.002, sigma_max=5.0,
-                rho=7.0, mem=None, mem_pose=None):
+                rho=7.0, mem=None, mem_pose=None, guidance=1.0):
     """Generate the next latent frame (normalised) given context [B, context, C, H, W]."""
     b = ctx.shape[0]
     dev = ctx.device
@@ -452,9 +505,56 @@ def sample_next(model, ctx, act, ev, steps=3, ctx_noise=0.05, sigma_min=0.002, s
     x = torch.randn(b, *ctx.shape[2:], device=dev) * sigmas[0]
     for i in range(steps):
         s = sigmas[i].expand(b)
-        d = (x - denoise(model, x, s, ctx, sigma_ctx, act, ev, mem, mem_pose)) / sigmas[i]
+        d = (x - denoise(model, x, s, ctx, sigma_ctx, act, ev, mem, mem_pose, guidance)) / sigmas[i]
         x = x + d * (sigmas[i + 1] - sigmas[i])
     return x
+
+
+class GraphedModel:
+    """Play mode runs the network at batch 1, where launching hundreds of small GPU kernels
+    costs more than the maths. This records one forward pass as a HIP/CUDA graph per input
+    signature and replays it as a single launch. Any failure falls back to the normal model."""
+
+    def __init__(self, model, amp="fp16"):
+        self.model, self.amp = model, amp
+        self.graphs, self.failed = {}, False
+        self.context, self.mem_k, self.event = model.context, model.mem_k, model.event
+
+    def __call__(self, *args):
+        dev = args[0].device
+        if self.failed or dev.type != "cuda":
+            return self.model(*args)
+        key = tuple(None if a is None else (tuple(a.shape), a.dtype) for a in args)
+        try:
+            if key not in self.graphs:
+                self.graphs[key] = self._capture(args)
+            g, ins, out = self.graphs[key]
+            for buf, a in zip(ins, args):
+                if buf is not None:
+                    buf.copy_(a)
+            g.replay()
+            return out.clone()
+        except Exception as e:  # graphs unsupported here: run normally from now on
+            print(f"GPU graph replay unavailable ({type(e).__name__}); running normally.")
+            self.failed = True
+            return self.model(*args)
+
+    def _capture(self, args):
+        ins = [None if a is None else a.clone() for a in args]
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), torch.autocast("cuda", dtype=AMP_DTYPES.get(self.amp) or torch.float32,
+                                                     enabled=AMP_DTYPES.get(self.amp) is not None,
+                                                     cache_enabled=False):
+            for _ in range(3):
+                self.model(*ins)
+        torch.cuda.current_stream().wait_stream(side)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g), torch.autocast("cuda", dtype=AMP_DTYPES.get(self.amp) or torch.float32,
+                                                 enabled=AMP_DTYPES.get(self.amp) is not None,
+                                                 cache_enabled=False):
+            out = self.model(*ins)
+        return g, ins, out
 
 
 # ---------------------------------------------------------------------------------------
