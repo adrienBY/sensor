@@ -77,6 +77,9 @@ def main():
     ap.add_argument("--sharpness", type=float, default=0.25,
                     help="FSR 1 RCAS sharpening in stops: 0 = strongest, 2 = mild")
     ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
+    ap.add_argument("--guidance", type=float, default=1.0,
+                    help="action guidance (1 = off, 1.5-2 follows your keys more firmly, 2x slower)")
+    ap.add_argument("--no-graphs", action="store_true", help="disable GPU graph replay")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -97,6 +100,7 @@ def main():
     print(f"Matching the dream videos: {args.steps} denoising steps, {fps} frames per second, "
           f"walk {step_m * fps:.2f} m/s, turn {np.degrees(turn) * fps:.0f} deg/s, "
           f"look {np.degrees(look) * fps:.0f} deg/s (from your footage)")
+    net = model if args.no_graphs else wm.GraphedModel(model, args.amp)
     state = {}
 
     def reset():
@@ -158,7 +162,8 @@ def main():
             mem, mem_pose = wm.memory_for(state["take"], state["R"], state["p"], model.mem_k,
                                           device)
         with wm.autocast(device, args.amp):
-            z = wm.sample_next(model, ctx, a, e, steps=args.steps, mem=mem, mem_pose=mem_pose)
+            z = wm.sample_next(net, ctx, a, e, steps=args.steps, mem=mem, mem_pose=mem_pose,
+                               guidance=args.guidance)
         ctx = torch.cat([ctx[:, 1:], z[:, None].float()], dim=1)
         img = decode(vae, z, ck["stats"], dtype)[0]
         h, w = img.shape[:2]

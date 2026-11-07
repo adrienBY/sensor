@@ -37,7 +37,7 @@ TORCH = [ROCM + "torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl"]
 EXTRA = ["numpy", "opencv-python", "diffusers", "safetensors", "accelerate"]
 DEFAULT_SETTINGS = {"train_minutes": 60, "fps": 15, "width": 256, "height": 144,
                     "amp": "fp16", "batch": 64, "tunableop": False, "dream_steps": 3,
-                    "run": "memory"}
+                    "run": "memory", "action_guidance": 1.0}
 MODEL_VERSION = "memory-1"   # the benchmark re-runs once when the model architecture changes
 
 FROZEN = getattr(sys, "frozen", False)
@@ -431,11 +431,12 @@ def menu(py, s):
             if choice == "4":
                 step(py, "Walking in the dream: the window opens shortly", "play.py",
                      PROCESSED, RUN / "last.pt", "--amp", s["amp"], "--steps", s["dream_steps"],
+                     "--guidance", s["action_guidance"],
                      env=env_for(s))
             else:
                 if step(py, "Making dream videos: each clip with 3 and 10 denoising steps to "
                         "compare", "dream.py", PROCESSED, RUN / "last.pt", "--amp", s["amp"],
-                        "--steps", "3,10", env=env_for(s)):
+                        "--steps", "3,10", "--guidance", s["action_guidance"], env=env_for(s)):
                     open_folder(RUN / "dreams")
         elif choice == "6":
             open_folder(HOME)
