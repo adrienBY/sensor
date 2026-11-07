@@ -203,7 +203,11 @@ def main():
 
         now = time.time()
         if now - log_t >= 30:
-            print(f"step {step:7d}  loss {log_loss.item() / log_n:.4f}  "
+            # Read the loss (this waits for the GPU to finish the queued steps) BEFORE taking
+            # the time, so each window is charged for its own GPU work, not the previous one's.
+            loss_avg = log_loss.item() / log_n
+            now = time.time()
+            print(f"step {step:7d}  loss {loss_avg:.4f}  "
                   f"{log_n / (now - log_t):6.1f} steps/s  "
                   f"{log_n * args.batch / (now - log_t):7.0f} samples/s  "
                   f"{(args.minutes * 60 - (now - t0)) / 60:5.1f} min left", flush=True)
