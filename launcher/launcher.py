@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-LAUNCHER_VERSION = 4
+LAUNCHER_VERSION = 5
 ROCM = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/"
 ROCM_SDK = [
     ROCM + "rocm_sdk_core-7.2.1-py3-none-win_amd64.whl",
@@ -311,6 +311,47 @@ def train(py, s, minutes=None):
     return ok
 
 
+LATEST_EXE = "https://github.com/adrienBY/sensor/releases/latest/download/WorldModel.exe"
+
+
+def update_self():
+    """Download the newest WorldModel.exe from the GitHub releases and swap it in place.
+    Everything else in the folder (.runtime, settings.json, data, runs) is kept."""
+    if not FROZEN:
+        say("Updating only works for WorldModel.exe.")
+        return False
+    import urllib.request
+    exe = Path(sys.executable)
+    new, old = exe.with_name(exe.stem + ".new.exe"), exe.with_name(exe.stem + ".old.exe")
+    header("Downloading the latest WorldModel.exe")
+    try:
+        with urllib.request.urlopen(LATEST_EXE, timeout=60) as r, open(new, "wb") as f:
+            shutil.copyfileobj(r, f)
+        if new.stat().st_size < 5_000_000:
+            raise OSError("the download is too small to be the program")
+        if old.exists():
+            old.unlink()
+        exe.rename(old)                 # Windows allows renaming a running .exe, not replacing it
+        new.rename(exe)
+    except Exception as e:
+        say(f"Update failed: {e}")
+        if new.exists():
+            new.unlink()
+        return False
+    say("Updated. Close this window and start WorldModel.exe again. Your install, settings, "
+        "footage and model are all kept.")
+    return True
+
+
+def cleanup_old_exe():
+    if FROZEN:
+        old = Path(sys.executable).with_name(Path(sys.executable).stem + ".old.exe")
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 def open_folder(path):
     try:
         if os.name == "nt":
@@ -347,6 +388,7 @@ def menu(py, s):
         say("  4  Walk in the dream (keyboard)")
         say("  5  Make dream videos")
         say("  6  Open the WorldModel folder")
+        say("  U  Update WorldModel.exe to the latest build (keeps everything)")
         say("  Q  Quit")
         choice = input("> ").strip().lower()
         if choice == "1":
@@ -374,6 +416,9 @@ def menu(py, s):
                     open_folder(RUN / "dreams")
         elif choice == "6":
             open_folder(HOME)
+        elif choice == "u":
+            if update_self():
+                return
         elif choice in ("q", "quit", "exit"):
             return
 
@@ -430,6 +475,7 @@ def main():
             pass
         return
     windows_unattended()
+    cleanup_old_exe()
     LOGS.mkdir(parents=True, exist_ok=True)
     LOG_FILE = open(LOGS / f"{datetime.datetime.now():%Y%m%d-%H%M%S}.log", "w", encoding="utf-8")
     try:

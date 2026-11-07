@@ -56,7 +56,13 @@ def encode_take(vae, take: Path, device, dtype, batch: int, force: bool):
     bottom = np.hstack(list(rec))
     cv2.imwrite(str(take / "preview.png"), cv2.cvtColor(np.vstack([top, bottom]), cv2.COLOR_RGB2BGR))
 
-    stats = {"latent_mean": float(latents.mean()), "latent_std": float(latents.std()),
+    bad = int((~np.isfinite(latents)).sum())
+    if bad:
+        print(f"  WARNING: {bad} latent values are not finite (encoder overflow); "
+              "this take may train badly")
+    # float64 accumulation: summing millions of squares in float16 overflows to inf
+    stats = {"latent_mean": float(latents.mean(dtype=np.float64)),
+             "latent_std": float(latents.std(dtype=np.float64)),
              "latent_shape": list(latents.shape[1:]), "encoder": MODEL_ID}
     info_path = take / "take.json"
     info = json.loads(info_path.read_text()) if info_path.exists() else {}
