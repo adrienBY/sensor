@@ -14,6 +14,9 @@ It runs with the same settings as the dream videos: the same model copy (EMA), d
 steps, context noise and memory, one frame per 1/15 s (the footage's frame rate), and walking
 and turning speeds measured from your own footage, so each key press is a movement the model
 has actually seen. On Windows several keys can be held at once (walk and turn together).
+With no key held the dream pauses on the current frame: your footage never has a perfectly
+still camera, so generating "no movement" frames only makes the dream drift. After an
+interaction key it keeps running for a second so you see the change happen.
 """
 import argparse
 import random
@@ -67,7 +70,7 @@ def main():
     ap.add_argument("processed", type=Path)
     ap.add_argument("checkpoint", type=Path)
     ap.add_argument("--steps", type=int, default=3, help="denoising steps (fewer = faster)")
-    ap.add_argument("--scale", type=int, default=4, help="window size multiplier")
+    ap.add_argument("--scale", type=int, default=3, help="window size multiplier (3 = like the videos)")
     ap.add_argument("--amp", choices=["fp16", "bf16", "fp32"], default="fp16")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -107,6 +110,8 @@ def main():
     fps_t, frames = time.time(), 0
     fps_text = ""
     frame_t = time.time()
+    run_on = 0                 # frames still to generate after an interaction key
+    img = None
     while True:
         rot = np.zeros(3, np.float32)
         trans = np.zeros(3, np.float32)
@@ -128,6 +133,16 @@ def main():
             ctx = reset()
         if k == "q" or key == 27:
             break
+        if event:
+            run_on = fps                                   # let the interaction play out
+        moving = bool(np.any(rot) or np.any(trans))
+        if img is not None and not moving and not event and run_on <= 0 and k != "r":
+            key = cv2.waitKey(30)                          # paused: keep the last frame
+            if cv2.getWindowProperty(win, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            frame_t = time.time()
+            continue
+        run_on -= 1
         has_trans = 1.0 if np.any(trans) else 0.0
         a = torch.from_numpy(wm.action_vector(rot, trans, has_trans))[None].to(device)
         e = torch.tensor([event], device=device)
